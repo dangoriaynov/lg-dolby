@@ -1,0 +1,157 @@
+services:
+
+  # ============================================================
+  # JELLYFIN — Media Server
+  # Access: http://<server-ip>:8096
+  # ============================================================
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    runtime: nvidia
+    environment:
+      - JELLYFIN_PublishedServerUrl=http://192.168.1.216:8096
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ${CONFIG_PATH}/jellyfin:/config
+      - ${CONFIG_PATH}/jellyfin/cache:/cache
+      - ${DATA_PATH}/media:/data/media:ro  # read-only: Jellyfin only reads media
+    ports:
+      - "8096:8096"
+      # DLNA (optional, for LG TV built-in player fallback)
+      - "1900:1900/udp"
+      - "7359:7359/udp"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, video]
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # QBITTORRENT — Torrent Client
+  # Access: http://<server-ip>:8085
+  # Default login: admin / (check logs: docker logs qbittorrent)
+  # ============================================================
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8085
+    volumes:
+      - ${CONFIG_PATH}/qbittorrent:/config
+      - ${DATA_PATH}:/data  # Full /data access for downloads
+    ports:
+      - "8085:8085"
+      - "6881:6881"
+      - "6881:6881/udp"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # PROWLARR — Indexer Manager (toloka.to, 1337x, RuTracker, etc.)
+  # Access: http://<server-ip>:9696
+  # ============================================================
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/prowlarr:/config
+    ports:
+      - "9696:9696"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # RADARR — Movie Automation
+  # Access: http://<server-ip>:7878
+  # ============================================================
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/radarr:/config
+      - ${DATA_PATH}:/data  # Same /data mount — enables hardlinks
+    ports:
+      - "7878:7878"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # SONARR — TV Show Automation
+  # Access: http://<server-ip>:8989
+  # ============================================================
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/sonarr:/config
+      - ${DATA_PATH}:/data  # Same /data mount — enables hardlinks
+    ports:
+      - "8989:8989"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # BAZARR — Subtitle Automation (Ukrainian + English)
+  # Access: http://<server-ip>:6767
+  # ============================================================
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/bazarr:/config
+      - ${DATA_PATH}/media:/data/media  # Needs access to media for subtitle matching
+    ports:
+      - "6767:6767"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+  # ============================================================
+  # JELLYSEERR — Request & Browse UI
+  # Access: http://<server-ip>:5055
+  # ============================================================
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/jellyseerr:/app/config
+    ports:
+      - "5055:5055"
+    restart: unless-stopped
+    networks:
+      - media-net
+
+networks:
+  media-net:
+    driver: bridge
