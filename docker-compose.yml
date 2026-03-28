@@ -136,11 +136,11 @@ services:
       - media-net
 
   # ============================================================
-  # JELLYSEERR — Request & Browse UI
+  # SEERR — Request & Browse UI (successor to Jellyseerr)
   # Access: http://<server-ip>:5055
   # ============================================================
   jellyseerr:
-    image: fallenbagel/jellyseerr:latest
+    image: ghcr.io/seerr-team/seerr:latest
     container_name: jellyseerr
     environment:
       - TZ=${TZ}
