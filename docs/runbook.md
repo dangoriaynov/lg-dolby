@@ -187,3 +187,36 @@ With Jellyfin down, Jellyseerr had no media backend:
 **Takeaway.** Jellyfin no longer touches the GPU, so this class of outage cannot
 recur from driver bumps. If the `llm` container ever shows the same NVML error
 after a host driver upgrade, apply §4 to *its* LXC.
+
+---
+
+## 6. Downloads, quality & manual torrents (Radarr / Prowlarr / qBittorrent)
+
+- **Network constraint:** the link to the server is ~**100 Mbit/s** (damaged
+  cable). Keep releases modest — avoid Remux/4K (10–40 GB).
+- **Radarr quality policy** (profile **"Any"**, used by the movies): allows up to
+  **Bluray-1080p**, cutoff **Bluray-1080p**, upgrades on; **Remux-1080p / 2160p
+  intentionally off**. Size caps already reject big files (global indexer max
+  **14.6 GB**; per-movie quality-definition max ~**9.4 GB**). Language =
+  *Original* (English) — Ukr/Eng dual-audio toloka rips pass because they include
+  the English track.
+- **Why Interactive Search shows red ❗ rows:** typical reasons — *"Existing file
+  meets cutoff"* (already have an equal/better file), *"<quality> is not wanted in
+  profile"*, *"Unknown Movie"* (collections / mini-movies / foreign-titled rips
+  Radarr can't match), and size limits. Red = won't grab **automatically**.
+- **Force-grab a specific release:** Radarr → movie → *Interactive Search* → click
+  the **download ⬇ arrow** on the row. It overrides the rejection, sends it to
+  qBittorrent, and Radarr imports it.
+- **Add a torrent fully manually:** download the `.torrent` from toloka.to (logged
+  in) → qBittorrent UI `http://192.168.1.216:8085` → add (saves under
+  `/data/torrents`). Radarr does not see manual adds, so import it:
+  Radarr → **Wanted / Movie → Manual Import**, folder `/data/torrents`, pick the
+  file, set **movie + quality**, Import with **mode Copy (= hardlink, keeps
+  seeding)**. API: `GET /api/v3/manualimport?folder=/data/torrents&filterExistingFiles=true`
+  then `POST /api/v3/command {name:ManualImport, importMode:copy, files:[{path, movieId, quality, languages}]}`.
+- **2026-06-21:** profile "Any" was 720p-capped and excluded Bluray-1080p — raised
+  to allow Bluray-1080p with cutoff 1080p. A manually-added
+  `Despicable Me (2010) BDRip 1080p H.265 [Hurtom]` was matched to the movie via
+  Manual Import (replaced the 720p; both torrents keep seeding). Note: **no
+  "Minions / Посіпаки (2015)" file exists on the server** — that's a separate
+  movie that was never added/downloaded.
