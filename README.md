@@ -1,6 +1,8 @@
 # Media Server Stack: Jellyfin + Arr Suite
 
-Self-hosted media server running in an LXC container with NVIDIA GPU transcoding. Search, download, and stream movies/TV shows to an LG TV with Dolby 5.1/Atmos audio.
+Self-hosted media server running in an LXC container. Search, download, and stream movies/TV shows to an LG TV with Dolby 5.1/Atmos audio.
+
+> **GPU note:** Jellyfin runs **without** the GPU. The host RTX 5070 Ti (16 GB) is reserved for the separate `llm` container. The LG 4K TV direct-plays H.264/HEVC, so HW transcoding is rarely needed and falls back to CPU. Full history and recovery steps: [docs/runbook.md](docs/runbook.md).
 
 ## What's Included
 
@@ -40,7 +42,7 @@ Self-hosted media server running in an LXC container with NVIDIA GPU transcoding
 
 - **TV:** LG 50UP78003LB (webOS 6, eARC, H265 hardware decode)
 - **Soundbar:** TCL Q85H (7.1.4ch, Dolby Atmos, DTS:X via eARC)
-- **Server:** Ubuntu 24.04 with NVIDIA GPU (NVENC transcoding)
+- **Server:** Ubuntu 24.04, NVIDIA RTX 5070 Ti (16 GB) — **reserved for the `llm` container; Jellyfin transcodes on CPU**
 
 ## Prerequisites
 
@@ -89,7 +91,7 @@ lxc config device add media-server proxy-bazarr proxy listen=tcp:0.0.0.0:6767 co
 3. **Sonarr** (`http://192.168.1.216:8989`) — same as Radarr with root folder `/data/media/tv`, category: `sonarr`
 4. **Prowlarr** (`http://192.168.1.216:9696`) — add toloka.to (or other trackers), connect to Radarr and Sonarr via Settings → Apps (use their API keys)
 5. **Bazarr** (`http://192.168.1.216:6767`) — add subtitle languages, enable providers (OpenSubtitles.com), connect to Radarr/Sonarr
-6. **Jellyfin** (`http://192.168.1.216:8096`) — run wizard, add libraries (`/data/media/movies`, `/data/media/tv`), enable **Nvidia NVENC** in Dashboard → Playback
+6. **Jellyfin** (`http://192.168.1.216:8096`) — run wizard, add libraries (`/data/media/movies`, `/data/media/tv`). **Do not enable NVENC** — Jellyfin has no GPU (reserved for the `llm` container); leave transcoding on CPU / rely on direct play. See [docs/runbook.md](docs/runbook.md)
 7. **Jellyseerr** (`http://192.168.1.216:5055`) — sign in with Jellyfin (`http://jellyfin:8096`), add Radarr (`http://radarr:7878`) and Sonarr (`http://sonarr:8989`)
 
 ### Step 6: Close admin ports

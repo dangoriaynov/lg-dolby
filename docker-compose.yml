@@ -3,15 +3,16 @@ services:
   # ============================================================
   # JELLYFIN — Media Server
   # Access: http://<server-ip>:8096
+  # NOTE: Runs WITHOUT GPU on purpose. The host GPU (RTX 5070 Ti, 16 GB) is
+  # reserved for the `llm` LXC container (llama-server uses ~14.4/16 GB VRAM).
+  # The LG 4K TV direct-plays H.264/HEVC, so HW transcoding is rarely needed;
+  # any transcode falls back to CPU. See docs/runbook.md (2026-06-21 incident).
   # ============================================================
   jellyfin:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
-    runtime: nvidia
     environment:
       - JELLYFIN_PublishedServerUrl=http://192.168.1.216:8096
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       - ${CONFIG_PATH}/jellyfin:/config
       - ${CONFIG_PATH}/jellyfin/cache:/cache
@@ -21,13 +22,6 @@ services:
       # DLNA (optional, for LG TV built-in player fallback)
       - "1900:1900/udp"
       - "7359:7359/udp"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu, compute, video]
     restart: unless-stopped
     networks:
       - media-net
