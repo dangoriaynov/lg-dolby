@@ -200,6 +200,12 @@ after a host driver upgrade, apply §4 to *its* LXC.
   **14.6 GB**; per-movie quality-definition max ~**9.4 GB**). Language =
   *Original* (English) — Ukr/Eng dual-audio toloka rips pass because they include
   the English track.
+- **Sonarr quality policy** (profile **"Any"**, used by the series): aligned with
+  Radarr on 2026-06-21 — **cutoff = WEB 1080p group**, **upgrades on**, allowed up
+  to **Bluray-1080p**, **all 2160p/Remux off**. Cutoff is the *WEB* 1080p tier
+  (not Bluray) because TV releases are mostly web; chasing rare Bluray season-packs
+  would re-download endlessly over the slow link. Bluray-1080p still ranks above
+  the cutoff, so it's accepted if it appears.
 - **Why Interactive Search shows red ❗ rows:** typical reasons — *"Existing file
   meets cutoff"* (already have an equal/better file), *"<quality> is not wanted in
   profile"*, *"Unknown Movie"* (collections / mini-movies / foreign-titled rips
