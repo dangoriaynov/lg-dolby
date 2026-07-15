@@ -226,3 +226,61 @@ after a host driver upgrade, apply §4 to *its* LXC.
   Manual Import (replaced the 720p; both torrents keep seeding). Note: **no
   "Minions / Посіпаки (2015)" file exists on the server** — that's a separate
   movie that was never added/downloaded.
+
+---
+
+## 7. Incident — 2026-07-15: "downloaded series has no play button"
+
+**Symptom.** Better Call Saul S1 was imported into Sonarr (10 files in
+`/data/media/tv/Better Call Saul`, 100%), but Jellyseerr kept showing the show
+as *Requested* with no play button, and Sonarr's Activity → Queue showed 10
+stuck entries (a 68 GB rutracker season pack) with a clock icon and no
+progress.
+
+**Root causes (two independent ones).**
+
+1. **Sonarr had no download client configured** (`GET /api/v3/downloadclient`
+   → `[]` — README step "add qBittorrent to Sonarr" was never done). A
+   Jellyseerr request had triggered a season search; the grabbed 68 GB pack
+   could never be sent anywhere, so it sat in the queue as
+   `downloadClientUnavailable` forever.
+2. **Jellyfin never scanned the imported files.** Its `Shows` library
+   (`/data/media/tv`) was correct, but real-time monitoring (inotify) doesn't
+   reliably propagate through the LXC/ro-bind mount, and no scheduled scan had
+   run since the import — Jellyfin had 0 Better Call Saul items, so Jellyseerr
+   (which mirrors Jellyfin availability) had nothing to link a play button to.
+
+**Fix applied (2026-07-15).**
+
+- Removed the 10 dead queue entries (`DELETE /api/v3/queue/{id}?removeFromClient=false&blocklist=false`).
+- Removed a bogus Sonarr root folder `/data/torrents/Better Call Saul 1080p H265`
+  (was accidentally created from the Add Series page; the only root folder is
+  `/data/media/tv`).
+- Added **qBittorrent as Sonarr's download client** (host `qbittorrent`, port
+  `8085`, category `sonarr` — credentials same as Radarr's; readable from
+  Radarr's DB: `DownloadClients.Settings` in `/config/radarr.db`). Health check
+  is green.
+- Triggered a Jellyfin library scan (`POST /Library/Refresh`) → series + 10
+  episodes appeared; ran Jellyseerr jobs `jellyfin-recently-added-scan` and
+  `availability-sync` → status flipped to *partially available* (S1 of 6), play
+  button restored.
+- **Prevention:** added a *Connect → Emby/Jellyfin* notification (implementation
+  `MediaBrowser`, host `jellyfin:8096`, "Update Library" on) to **both Sonarr
+  and Radarr**, so every future import/upgrade/rename pings Jellyfin to rescan
+  immediately instead of waiting for a periodic scan.
+
+**Useful keys/tricks discovered.**
+
+- Jellyfin API key: Jellyseerr stores the one it uses in
+  `/app/config/settings.json` (`docker exec jellyseerr grep -o 'apiKey[^,]*' /app/config/settings.json`);
+  use it as `X-Emby-Token`.
+- Jellyseerr's own API key is the first (base64-looking) `apiKey` in the same
+  file; jobs API: `POST /api/v1/settings/jobs/<id>/run`.
+- Jellyseerr media status codes: 1 unknown, 2 pending, 3 processing,
+  4 partially available, 5 available. The play button appears at 4+.
+
+**Takeaway.** "No play button" almost always means *Jellyfin doesn't have the
+item*, not a Jellyseerr bug: check `ls /data/media/...` first, then whether
+Jellyfin has scanned it. Stuck orange-clock queue rows with no Time Left mean
+the download was never handed to a client — check System → Health and
+Settings → Download Clients before blaming the tracker.
