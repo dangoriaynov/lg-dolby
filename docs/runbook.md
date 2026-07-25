@@ -310,8 +310,8 @@ Settings → Download Clients before blaming the tracker.
 
 **Symptom.** Opening Better Call Saul S01E02 in the web player and immediately
 jumping to ~15:00 closed the player and dumped the user back to the details
-page. Worse, the saved 15-minute resume point was gone, forcing a rewatch from
-the start.
+page — repeatedly, so the episode kept having to be restarted from the
+beginning.
 
 **Root cause.** Jellyfin's own encoding config still requested NVENC:
 
@@ -332,11 +332,18 @@ Failed to set value 'cuda=cu:0' for option 'init_hw_device'
 
 Why it only broke *on seek*: the file is 1080p HEVC Main10 + AC3 5.1, so the
 web player uses **DirectStream** (video copied, audio → AAC) — that path never
-touches an encoder and plays fine from 0. Seeking makes the player fetch a
-fresh fMP4 init segment, `GET /videos/{id}/hls1/main/-1.mp4`, which Jellyfin
-serves from a **real transcode** job → instant 255 → HTTP 500 → the player
-gives up and reports `Playback stopped … Stopped at 0 ms`. That 0 ms **is what
-wiped the resume point.**
+touches an encoder and plays fine from 0. Per the logs, a seek restarts the
+remux job at `-ss` *successfully*, and then the player issues a fresh
+`PlaybackInfo` and re-negotiates onto a **transcode** path; its fMP4 init
+segment, `GET /videos/{id}/hls1/main/-1.mp4`, is served by a real encode job →
+instant 255 → HTTP 500 → the player gives up and reports
+`Playback stopped … Stopped at 0 ms`. Every failing cycle in the log ends on
+that same `-1.mp4` URL.
+
+Note the stored resume point **survived** (checked afterwards via
+`/Users/{userId}/Items/{id}` → `PlaybackPositionTicks` = 8634094370 ≈ 14:23);
+the "watch from the beginning" part of the symptom came from the player
+aborting mid-session, not from the position being erased.
 
 **Fix applied (2026-07-25).** Hardware acceleration → **None** (software):
 
@@ -350,7 +357,8 @@ lxc exec media-server -- docker start jellyfin
 ```
 
 (Equivalent one-click version: Dashboard → Playback → Hardware acceleration →
-None. Backup of the old file: `/tmp/encoding.xml.bak-20260726` inside the LXC.)
+None. Backup of the pre-fix file: `/opt/media-stack/encoding.xml.bak-20260726`
+inside the LXC; to revert, `sed 's|>none<|>nvenc<|'` with the container stopped.)
 
 **Verification.** Replayed the exact failing request; it now returns `200` with
 a valid init segment, and the generated command line is software:
@@ -362,8 +370,13 @@ a valid init segment, and the generated command line is software:
 Software cost is a non-issue on the Ryzen 9 7900 (24 threads): a 1080p
 HEVC 10-bit → H.264 encode of this file measured **11.2× realtime**.
 
-**Note.** The fix cannot restore the resume point that was already overwritten
-with 0 — that episode starts from the beginning once more, then behaves.
+Also confirmed after the restart: **zero** `exited with code 255`, no
+`init_hw_device cuda` in any new ffmpeg log, and the next session reported
+`Playback stopped … Stopped at 863409 ms` — a real position instead of 0.
+
+**Side effect to expect.** Because the post-seek re-negotiation lands on the
+transcode path, seeks may now be served by software encoding rather than remux
+— a brief pause at the seek point is normal, not a regression.
 
 **Takeaway.** Two switches control the GPU and they drift apart: the compose
 file and Jellyfin's own encoding settings. Whenever hardware is added to or
