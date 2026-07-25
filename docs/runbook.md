@@ -48,6 +48,20 @@ lxc exec media-server -- bash -lc 'cd /opt/media-stack && docker compose ps'
   everything and never transcodes. CPU only kicks in for edge cases
   (e.g. AV1 source, subtitle burn-in, exotic audio).
 
+> **Invariant — no GPU ⇒ hardware acceleration MUST be None.**
+> The compose file and Jellyfin's *own* encoding settings are two separate
+> switches. If `Dashboard → Playback → Hardware acceleration` is left on
+> **NVENC** while the container has no GPU, every transcode ffmpeg dies
+> instantly with `Cannot load libcuda.so.1` / `exited with code 255`, and
+> clients abort playback the moment anything needs a real encode. Direct-play
+> and remux keep working, so the breakage is invisible until someone seeks.
+> See §8. Verify with:
+>
+> ```bash
+> ssh danko@10.100.0.1 'lxc exec media-server -- docker exec jellyfin \
+>   grep HardwareAccelerationType /config/config/encoding.xml'   # must be: none
+> ```
+
 Why not give Jellyfin the GPU?
 1. **VRAM contention** — only ~1.8 GB free; a 4K transcode or several streams
    would fail with out-of-memory.
@@ -71,6 +85,9 @@ If you ever *do* need NVENC on Jellyfin, re-add to the `jellyfin` service in
               count: 1
               capabilities: [gpu, compute, video]
 ```
+
+…and only *then* flip `Hardware acceleration` back to **NVIDIA NVENC** in
+Jellyfin. Compose first, Jellyfin setting second — never the other way round.
 
 Check GPU usage at any time:
 
@@ -284,3 +301,73 @@ item*, not a Jellyseerr bug: check `ls /data/media/...` first, then whether
 Jellyfin has scanned it. Stuck orange-clock queue rows with no Time Left mean
 the download was never handed to a client — check System → Health and
 Settings → Download Clients before blaming the tracker.
+
+---
+
+## 8. Incident — 2026-07-25: "seeking kills playback, resume point lost"
+
+*(all log timestamps below are UTC — local time was the night of the 26th)*
+
+**Symptom.** Opening Better Call Saul S01E02 in the web player and immediately
+jumping to ~15:00 closed the player and dumped the user back to the details
+page. Worse, the saved 15-minute resume point was gone, forcing a rewatch from
+the start.
+
+**Root cause.** Jellyfin's own encoding config still requested NVENC:
+
+```
+/config/config/encoding.xml → <HardwareAccelerationType>nvenc</HardwareAccelerationType>
+```
+
+…while the container has **no GPU** by design (§2 — removed in 47128d2, which
+touched only `docker-compose.yml`). Nobody flipped the matching switch inside
+Jellyfin. Every transcode therefore died on startup:
+
+```
+[AVHWDeviceContext] Cannot load libcuda.so.1
+Device creation failed: -1.
+Failed to set value 'cuda=cu:0' for option 'init_hw_device'
+→ FFmpeg exited with code 255      (44 times in one evening)
+```
+
+Why it only broke *on seek*: the file is 1080p HEVC Main10 + AC3 5.1, so the
+web player uses **DirectStream** (video copied, audio → AAC) — that path never
+touches an encoder and plays fine from 0. Seeking makes the player fetch a
+fresh fMP4 init segment, `GET /videos/{id}/hls1/main/-1.mp4`, which Jellyfin
+serves from a **real transcode** job → instant 255 → HTTP 500 → the player
+gives up and reports `Playback stopped … Stopped at 0 ms`. That 0 ms **is what
+wiped the resume point.**
+
+**Fix applied (2026-07-25).** Hardware acceleration → **None** (software):
+
+```bash
+# Jellyfin rewrites encoding.xml on shutdown — it MUST be stopped for the edit to stick.
+lxc exec media-server -- docker stop jellyfin
+lxc exec media-server -- docker cp jellyfin:/config/config/encoding.xml /tmp/encoding.xml
+lxc exec media-server -- sed -i 's|>nvenc<|>none<|' /tmp/encoding.xml     # HardwareAccelerationType
+lxc exec media-server -- docker cp /tmp/encoding.xml jellyfin:/config/config/encoding.xml
+lxc exec media-server -- docker start jellyfin
+```
+
+(Equivalent one-click version: Dashboard → Playback → Hardware acceleration →
+None. Backup of the old file: `/tmp/encoding.xml.bak-20260726` inside the LXC.)
+
+**Verification.** Replayed the exact failing request; it now returns `200` with
+a valid init segment, and the generated command line is software:
+
+```
+-codec:v:0 libx264 -preset veryfast -crf 23 …    ← no init_hw_device cuda, no h264_nvenc
+```
+
+Software cost is a non-issue on the Ryzen 9 7900 (24 threads): a 1080p
+HEVC 10-bit → H.264 encode of this file measured **11.2× realtime**.
+
+**Note.** The fix cannot restore the resume point that was already overwritten
+with 0 — that episode starts from the beginning once more, then behaves.
+
+**Takeaway.** Two switches control the GPU and they drift apart: the compose
+file and Jellyfin's own encoding settings. Whenever hardware is added to or
+removed from a container, change *both*. Symptom signature to remember:
+**plays fine from the start but dies on seek** = the direct-play/remux path
+works and the encoder path is broken — grep the logs for
+`exited with code 255`.
