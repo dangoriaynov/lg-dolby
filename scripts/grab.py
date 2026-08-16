@@ -342,17 +342,29 @@ def cmd_search(query, state):
     results.sort(key=lambda r: (r.get("seeders") or 0), reverse=True)
     pool = candidates()
 
-    rows = []
+    # Той самий реліз часто лежить на кількох трекерах (Mazepa здебільшого дублює
+    # Toloka, але з мертвим роєм). Згортаємо за точним розміром у байтах —
+    # результати вже відсортовані за сідами, тож лишається найживіша копія.
+    rows, seen = [], {}
     for item in results:
+        size = item.get("size") or 0
+        if size and size in seen:
+            other = item.get("indexer")
+            if other and other not in seen[size]["also"]:
+                seen[size]["also"].append(other)
+            continue
         target, score = match_target(item.get("title") or "", pool)
-        rows.append({
-            "title": item.get("title"), "size": item.get("size") or 0,
+        row = {
+            "title": item.get("title"), "size": size,
             "seeders": item.get("seeders"), "indexer": item.get("indexer"),
             "downloadUrl": item.get("downloadUrl"), "magnetUrl": item.get("magnetUrl"),
-            "guid": item.get("guid"),
+            "guid": item.get("guid"), "also": [],
             "categories": [c.get("name") for c in (item.get("categories") or []) if c.get("name")],
             "target": target, "score": score,
-        })
+        }
+        if size:
+            seen[size] = row
+        rows.append(row)
 
     state["last_search"] = {"query": query, "results": rows}
     save_state(state)
@@ -367,9 +379,11 @@ def cmd_search(query, state):
         target = row["target"]
         aim = ("→ %s (%s)" % (target["title"], target["year"])) if target else "→ ціль не вгадав, вкажи --to"
         flag = "" if not target or not target["have"] else "  [вже є файл]"
+        also = (" (також: %s)" % ", ".join(row["also"])) if row.get("also") else ""
         print("[%d] %s" % (idx, row["title"]))
-        print("    %.2f ГБ · сідів %s · %s · %s" % (
-            row["size"] / 1e9, row["seeders"], row["indexer"], ", ".join(row["categories"][:2])))
+        print("    %.2f ГБ · сідів %s · %s%s · %s" % (
+            row["size"] / 1e9, row["seeders"], row["indexer"], also,
+            ", ".join(row["categories"][:2])))
         print("    %s%s" % (aim, flag))
     print("\nВзяти:  grab <номер>            (напр. grab 0)")
     print("Явно:   grab <номер> --to movie:<id>|series:<id>")

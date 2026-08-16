@@ -532,8 +532,16 @@ the upgrade — both predate it):
    5 releases — but with Japanese audio and English subs, so it complements
    Toloka rather than replacing it. Of the 621 indexer definitions Prowlarr
    ships, exactly **four are uk-UA**: Toloka.to and Mazepa (both semi-private,
-   free registration) plus 0day.kiev and UTOPIA (invite-only). Mazepa is the
-   only realistic way to widen the *Ukrainian* catalogue.
+   free registration) plus 0day.kiev and UTOPIA (invite-only).
+
+   **Mazepa was added too** (indexer id 4, login OK). Verdict after live probes:
+   it largely **mirrors Toloka's catalogue but with dead swarms** — for
+   *Arrietty* it returns the same four releases with **0 seeders** where Toloka
+   has 20/14/9/4, and it contributes two Toloka doesn't have (a 3.11 GB 720p and
+   a 25.75 GB BDRemux). So it's a genuine fallback for titles Toloka lacks, not
+   a primary source. Because `grab` sorts by seeders and collapses duplicates by
+   exact byte size (keeping the best-seeded copy and annotating
+   "також: Mazepa"), the mirror rows never crowd the picker.
 2. **Bazarr has never downloaded a subtitle.** `enabled_providers: []`, no
    language profiles, `movie_default_enabled: false` / `serie_default_enabled:
    false` — it is wired to Radarr/Sonarr and does nothing. Not urgent in practice:
