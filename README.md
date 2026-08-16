@@ -112,6 +112,19 @@ lxc config device remove media-server proxy-bazarr
 2. **Wait:** Radarr picks the best H265 + Dolby release, qBittorrent downloads it, Bazarr adds subtitles — all automatic
 3. **Watch:** Open Jellyfin on your LG TV, pick the movie, play — video direct-plays, audio passes through to the soundbar
 
+**When step 2 finds nothing** (common for Ukrainian-dubbed anime/cartoons: Radarr
+searches the English TMDB title, toloka lists them under Ukrainian ones), use the
+`./grab` helper in this repo instead of touching qBittorrent and Radarr by hand:
+
+```bash
+./grab                  # what's downloading + which requests still have no file
+./grab "аріетті"        # free-text search across toloka+rutracker via Prowlarr
+./grab 0                # take release #0 — it auto-binds to the matching request
+```
+
+Nothing else to do: a cron job inside the LXC imports the file when it finishes,
+pings Jellyfin to scan and Seerr to refresh availability. See runbook §6.
+
 ## TV & Soundbar Setup
 
 1. Connect soundbar to **HDMI 2 (eARC)** on the LG TV

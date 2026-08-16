@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# grab — обгортка з ноутбука: заливає scripts/grab.py у LXC media-server і запускає його там.
+# Репо лишається джерелом правди — кожен запуск оновлює копію на сервері (її ж смикає cron).
+#
+#   ./grab                       що качається / що ще недоступне
+#   ./grab "аріетті"             пошук релізів
+#   ./grab 0                     взяти реліз №0
+#   ./grab finish                доімпортувати докачане
+#
+# Хост можна перевизначити:  MEDIA_HOST=danko@10.100.0.1 ./grab …
+set -euo pipefail
+
+HOST="${MEDIA_HOST:-danko@10.100.0.1}"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# POSIX-безпечне лапкування: UTF-8 (кирилиця) проходить через віддалений shell без спотворень.
+quoted=""
+for arg in "$@"; do
+  quoted+=" '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+done
+
+exec ssh -o ConnectTimeout=20 "$HOST" \
+  "cat > /tmp/grab.py \
+   && lxc file push --quiet /tmp/grab.py media-server/opt/media-stack/grab.py \
+   && lxc exec media-server -- python3 /opt/media-stack/grab.py${quoted}" \
+  < "$DIR/scripts/grab.py"

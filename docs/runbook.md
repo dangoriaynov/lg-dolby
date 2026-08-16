@@ -230,19 +230,81 @@ after a host driver upgrade, apply §4 to *its* LXC.
 - **Force-grab a specific release:** Radarr → movie → *Interactive Search* → click
   the **download ⬇ arrow** on the row. It overrides the rejection, sends it to
   qBittorrent, and Radarr imports it.
-- **Add a torrent fully manually:** download the `.torrent` from toloka.to (logged
-  in) → qBittorrent UI `http://192.168.1.216:8085` → add (saves under
-  `/data/torrents`). Radarr does not see manual adds, so import it:
-  Radarr → **Wanted / Movie → Manual Import**, folder `/data/torrents`, pick the
-  file, set **movie + quality**, Import with **mode Copy (= hardlink, keeps
-  seeding)**. API: `GET /api/v3/manualimport?folder=/data/torrents&filterExistingFiles=true`
-  then `POST /api/v3/command {name:ManualImport, importMode:copy, files:[{path, movieId, quality, languages}]}`.
+- **Add a torrent by hand:** don't. Use `./grab` (§6.1) — it does the whole
+  chain in one command. The manual route is documented at the end of §6.1 as a
+  fallback for when the tool itself is broken.
 - **2026-06-21:** profile "Any" was 720p-capped and excluded Bluray-1080p — raised
   to allow Bluray-1080p with cutoff 1080p. A manually-added
   `Despicable Me (2010) BDRip 1080p H.265 [Hurtom]` was matched to the movie via
   Manual Import (replaced the 720p; both torrents keep seeding). Note: **no
   "Minions / Посіпаки (2015)" file exists on the server** — that's a separate
   movie that was never added/downloaded.
+
+### 6.1 `./grab` — hand-picked torrent → Jellyfin in one command
+
+**The problem it solves.** Radarr/Sonarr search indexers using the *English*
+TMDB title. Ukrainian-dubbed anime and cartoons on toloka are posted under
+Ukrainian titles, so the automatic search returns **0 releases** and the Seerr
+request sits at *Requested* forever — with nothing in the queue and no error
+anywhere. Verified 2026-08-16: `GET /api/v3/release?movieId=…` returned 0 rows
+for both "My Neighbors the Yamadas" and "The Secret World of Arrietty", while a
+free-text Prowlarr search for `Ямада` / `Аріетті` returned 6 and 4 releases.
+Radarr has no per-movie search alias, so this is not a setting that can be
+fixed — the search has to be done with a different query.
+
+**Usage** (wrapper `./grab` lives in the repo root, run it from the laptop):
+
+```bash
+./grab                     # what's downloading + which requests still have no file
+./grab "аріетті"           # free-text search, toloka+rutracker, sorted by seeders
+./grab 0                   # take release #0 from that search
+./grab 0 --to movie:25     # …with an explicit target if the auto-match is wrong
+./grab finish              # import whatever finished (cron already does this)
+./grab import <name-part> --to movie:25   # adopt a torrent already sitting in qB
+```
+
+**What it does under the hood** (`scripts/grab.py`, runs inside the LXC):
+
+1. Searches **Prowlarr** `/api/v1/search?query=…`. Prowlarr proxies the
+   `.torrent` download with its own tracker credentials, so no toloka login and
+   no hand-downloaded `.torrent` file is needed.
+2. Guesses the target request by matching the release title against every
+   Radarr/Sonarr title, `originalTitle` **and TMDB `alternateTitles`** — that's
+   what makes `Мої сусіди Ямада / Tonari no Yamada-kun (1999)` resolve to
+   *My Neighbors the Yamadas*. Below a score threshold it refuses to guess and
+   asks for `--to`.
+3. Adds the torrent to qBittorrent **with no category, on purpose**. A torrent
+   in category `radarr` gets picked up by Completed Download Handling, which
+   can't match the Ukrainian name and leaves a stuck "Unknown Movie" queue row —
+   the §7 failure mode. The binding to the request is carried by the explicit
+   `movieId`/`seriesId` in the state file, not by the category.
+4. `grab finish` (cron, `*/5`) runs ManualImport with **importMode `copy`**
+   (= hardlink, the torrent keeps seeding), an explicit `movieId`/`episodeIds`,
+   and an explicit quality — parsed from the release name when Radarr reports
+   `Unknown`, so files don't land at Unknown quality and confuse upgrade logic.
+   Note toloka writes `1080р` with a **Cyrillic р**; the parser normalises
+   homoglyphs before matching.
+5. Then pings Jellyfin `POST /Library/Refresh` and runs the Seerr jobs
+   `jellyfin-recently-added-scan` + `availability-sync`, so the play button
+   appears without waiting for a periodic scan.
+
+State: `/opt/media-stack/grab-state.json` (tracked torrents → target).
+Log: `/opt/media-stack/logs/grab.log`. Cron entry inside the LXC:
+
+```
+*/5 * * * * /usr/bin/python3 /opt/media-stack/grab.py finish --quiet >> /opt/media-stack/logs/grab.log 2>&1
+```
+
+The wrapper re-uploads `scripts/grab.py` to `/opt/media-stack/grab.py` on every
+run, so the repo stays the source of truth and cron never runs a stale copy.
+
+**Manual fallback** (only if `grab` itself is broken): download the `.torrent`
+from toloka.to while logged in → qBittorrent UI `http://192.168.1.216:8085` →
+add, saves under `/data/torrents`, **leave the category empty** → Radarr →
+*Wanted → Manual Import*, folder `/data/torrents`, pick the file, set movie +
+quality, Import with mode **Copy**. API equivalent:
+`GET /api/v3/manualimport?folder=/data/torrents&filterExistingFiles=true` then
+`POST /api/v3/command {name:ManualImport, importMode:copy, files:[{path, movieId, quality, languages}]}`.
 
 ---
 
