@@ -98,11 +98,13 @@ def api(url, key, method="GET", data=None, timeout=300, header="X-Api-Key"):
 class QBit:
     def __init__(self):
         user, password = qb_creds()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         payload = urllib.parse.urlencode({"username": user, "password": password}).encode()
         answer = self.opener.open(QBIT + "/api/v2/auth/login", payload, timeout=30).read()
-        if b"Ok" not in answer:
+        # 5.1 відповідало тілом "Ok." / "Fails."; 5.2.3 віддає 204 з порожнім тілом
+        # і лише ставить кукі. Тому ознака успіху — саме кукі сесії, не текст.
+        if b"Fails" in answer or not any(c.name.startswith("QBT_SID") for c in jar):
             raise SystemExit("qBittorrent: логін не вдався (%r)" % answer[:60])
 
     def torrents(self):
@@ -180,8 +182,12 @@ def normalize(text):
     return re.sub(r"[^a-z0-9а-яїієґ ]+", " ", text)
 
 
+STOPWORDS = {"the", "and", "for", "you", "der", "die", "das", "los", "las",
+             "collection", "trilogy", "part", "уперед", "збірка", "колекція"}
+
+
 def tokens(text):
-    return {t for t in normalize(text).split() if len(t) > 2}
+    return {t for t in normalize(text).split() if len(t) > 2 and t not in STOPWORDS}
 
 
 def candidates():
@@ -224,9 +230,17 @@ def match_target(release_title, pool):
             norm = normalize(title).strip()
             if len(norm) > 3 and norm in haystack:
                 score = max(score, 4.0 + len(norm) / 100.0)
-            overlap = tokens(title) & hay_tokens
-            if tokens(title):
-                score = max(score, 3.0 * len(overlap) / len(tokens(title)))
+            sig = tokens(title)
+            if not sig:
+                continue
+            overlap = sig & hay_tokens
+            # Одного спільного слова замало: "Панда Кунг-фу: Колекція" ділить
+            # рівно "панда" з "Panda! Go Panda!" — і без цього обмеження 23 ГБ
+            # чужого релізу причепились би до дитячого мультика 1972 року.
+            if len(overlap) >= 2:
+                score = max(score, 3.0 * len(overlap) / len(sig))
+            elif overlap:
+                score = max(score, 2.0 if len(sig) == 1 else 1.5 / len(sig))
         if cand["year"] and str(cand["year"]) in release_title:
             score += 1.5
         if not cand["have"]:
