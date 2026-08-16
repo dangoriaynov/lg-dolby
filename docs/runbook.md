@@ -446,3 +446,80 @@ removed from a container, change *both*. Symptom signature to remember:
 **plays fine from the start but dies on seek** = the direct-play/remux path
 works and the encoder path is broken — grep the logs for
 `exited with code 255`.
+
+---
+
+## 9. Upgrading the stack (2026-08-16 — and how to repeat it)
+
+Images had not been refreshed since March; everything was on `:latest`, which
+means the *next* `docker compose pull` decides the version for you. All seven
+were bumped and then **pinned to app versions**:
+
+| Service | was | now |
+|---|---|---|
+| Jellyfin | 10.11.6 | **10.11.11** |
+| Seerr | 3.1.0 | **v3.4.1** |
+| Radarr | 6.0.4 | **6.3.0** |
+| Sonarr | 4.0.17 | **4.0.19** |
+| Prowlarr | 2.3.0 | **2.5.2** |
+| Bazarr | 1.5.6 | **1.6.0** |
+| qBittorrent | 5.1.4 | **5.2.3** |
+
+No major boundary was crossed — that's what made this safe. **Check that before
+upgrading**, because a major bump (Sonarr v4 → v5 is the one waiting to happen)
+changes API surfaces that Prowlarr's app-sync, Seerr's connectors and Bazarr all
+depend on, and every container still reports "healthy" while the wiring is dead.
+
+**The procedure, in order:**
+
+```bash
+# 1. Backup: native *arr backups (consistent sqlite) + tar of all configs
+#    POST /api/v3/command {"name":"Backup"}  (Prowlarr is /api/v1)
+lxc exec media-server -- tar czf /opt/media-stack/backups/config-$(date +%Y%m%d-%H%M).tar.gz \
+  -C /opt/media-stack --exclude=config/jellyfin/cache config
+
+# 2. Find what :latest currently points at, BEFORE trusting it. On Docker Hub,
+#    find the version tag sharing latest's digest:
+#    https://hub.docker.com/v2/repositories/linuxserver/sonarr/tags/?page_size=100
+# 3. Pin those versions in docker-compose.yml, push it, validate:
+lxc file push docker-compose.yml media-server/opt/media-stack/docker-compose.yml
+lxc exec media-server -- bash -lc 'cd /opt/media-stack && docker compose config --quiet'
+
+# 4. Pull FIRST and inspect the labels — pulling touches no running container:
+lxc exec media-server -- bash -lc 'cd /opt/media-stack && docker compose pull'
+lxc exec media-server -- docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' <image>
+
+# 5. Only then recreate, and verify the links (not just "healthy"):
+lxc exec media-server -- bash -lc 'cd /opt/media-stack && docker compose up -d'
+```
+
+**What "verify" means here** — every one of these was green on 2026-08-16:
+`/api/v3/health` on Radarr+Sonarr and `/api/v1/health` on Prowlarr;
+`POST /api/v3/downloadclient/test` (both *arr → qBittorrent);
+`POST /api/v1/applications/test` (Prowlarr → Radarr, Sonarr, `fullSync`);
+`POST /api/v3/notification/test` (both *arr → Jellyfin, `updateLibrary=true`);
+`GET /api/v1/service/radarr|sonarr/{id}` in Seerr (profiles + root folders come
+back); and the §2 invariant — `HardwareAccelerationType` survived the Jellyfin
+upgrade as `none`, `DeviceRequests` still `[]`.
+
+Rollback: `docker-compose.yml.bak-20260816` inside the LXC, config tarball in
+`/opt/media-stack/backups/`, plus each *arr's own zip in `/config/Backups`.
+
+**Two pre-existing breakages surfaced by the verification** (neither caused by
+the upgrade — both predate it):
+
+1. **RuTracker is dead in Prowlarr.** `[403:Forbidden] POST
+   https://rutracker.org/forum/login.php`, and the response body is a Cloudflare
+   *"Just a moment…"* interstitial — bot protection, not bad credentials. Prowlarr
+   cannot solve a JS challenge on its own; the usual fix is a **FlareSolverr**
+   container added as a Prowlarr proxy. Until then **Toloka.to is effectively the
+   only working indexer** (which is why §6.1 searches only ever return toloka
+   results). Radarr/Sonarr show this as "Indexers unavailable due to failures for
+   more than 6 hours".
+2. **Bazarr has never downloaded a subtitle.** `enabled_providers: []`, no
+   language profiles, `movie_default_enabled: false` / `serie_default_enabled:
+   false` — it is wired to Radarr/Sonarr and does nothing. Not urgent in practice:
+   the toloka rips carry embedded Ukrainian subtitle tracks, which Jellyfin reads
+   directly. To actually turn it on you need a provider account (OpenSubtitles.com)
+   or an account-free provider, plus a Ukrainian+English profile set as the
+   default for both movies and series.

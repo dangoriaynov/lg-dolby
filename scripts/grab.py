@@ -18,6 +18,7 @@
 """
 
 import argparse
+import fcntl
 import http.cookiejar
 import json
 import os
@@ -32,6 +33,7 @@ import urllib.request
 
 CONFIG_ROOT = "/opt/media-stack/config"
 STATE_PATH = "/opt/media-stack/grab-state.json"
+LOCK_PATH = "/opt/media-stack/grab.lock"
 TORRENT_DIR = "/data/torrents"
 
 RADARR = "http://127.0.0.1:7878"
@@ -141,6 +143,19 @@ class QBit:
 # --------------------------------------------------------------------------
 # state
 # --------------------------------------------------------------------------
+
+def take_lock(quiet):
+    """Імпорт має виконуватись в один потік: cron (*/5) і ручний запуск легко
+    перетинаються, а два ManualImport одного файлу дають дубль у бібліотеці."""
+    handle = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if not quiet:
+            print("Інший grab уже імпортує — пропускаю.")
+        return None
+    return handle  # тримаємо відкритим до кінця процесу
+
 
 def load_state():
     if not os.path.exists(STATE_PATH):
@@ -395,9 +410,13 @@ def import_movie(entry, torrent, table):
         return False, "Radarr не побачив відеофайлів у %s" % wanted
     row = max(rows, key=lambda r: r.get("size") or 0)
 
-    quality = row.get("quality")
+    # Назва релізу на трекері авторитетніша за ім'я файлу: "My.Neighbors.the.
+    # Yamadas.1999(Artymko).mkv" не містить джерела, і Radarr здогадується по
+    # роздільній здатності → WEBDL-1080p, хоча реліз — BDRip. Занижена якість
+    # нижче cutoff'а профілю робить фільм кандидатом на «апгрейд» і перекачку.
+    quality = quality_for(entry["release"], table) or row.get("quality")
     if not quality or quality.get("quality", {}).get("id", 0) == 0:
-        quality = quality_for(entry["release"], table) or quality_for(row["path"], table)
+        quality = quality_for(row["path"], table)
     if not quality:
         return False, "не вдалось визначити якість для %s" % os.path.basename(row["path"])
 
@@ -439,9 +458,9 @@ def import_series(entry, torrent, table):
         if not episodes:
             skipped.append(os.path.basename(row["path"]))
             continue
-        quality = row.get("quality")
+        quality = quality_for(entry["release"], table) or row.get("quality")
         if not quality or quality.get("quality", {}).get("id", 0) == 0:
-            quality = quality_for(entry["release"], table) or quality_for(row["path"], table)
+            quality = quality_for(row["path"], table)
         if not quality:
             skipped.append(os.path.basename(row["path"]))
             continue
@@ -629,8 +648,12 @@ def main():
         print(__doc__)
         return 0
 
-    state = load_state()
     argv = opts.args
+    if argv and argv[0] in ("finish", "f", "import"):
+        if take_lock(opts.quiet) is None:
+            return 0
+
+    state = load_state()
 
     if not argv:
         return cmd_status(state)
