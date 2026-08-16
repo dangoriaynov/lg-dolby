@@ -543,3 +543,47 @@ the upgrade — both predate it):
    exact byte size (keeping the best-seeded copy and annotating
    "також: Mazepa"), the mirror rows never crowd the picker.
 2. **Bazarr had never downloaded a subtitle** — fixed the same day, see §9.1.
+
+### 9.1 Bazarr — why it fetched nothing, and what fixed it
+
+Bazarr was connected to Radarr/Sonarr with all 15 movies + 5 series synced, yet
+had **never downloaded a single subtitle**. The obvious-looking culprit is
+wrong: `enabled_providers` was *not* empty — `opensubtitlescom` was already in
+it, with a username saved. (A `grep` on `config.yaml` misleads here: the key is
+a YAML list, so its values sit on the following lines and the key line alone
+looks empty. Read it via `GET /api/system/settings`, not with grep.)
+
+The real blocker was **language profiles: there were none** (`GET
+/api/system/languages/profiles` → `[]`), so every movie and series carried
+`profileId: None`. With no profile there are no wanted languages, so there is
+nothing to search for — and Bazarr reports that as silence, not as an error.
+
+Fixed 2026-08-16 through the API (Bazarr rewrites `config.yaml` itself, so
+editing that file requires stopping the container — the same trap as Jellyfin's
+`encoding.xml` in §8):
+
+- created profile **UKR+ENG** (`uk`, `en`, no cutoff);
+- set it as the default for both movies and series;
+- assigned it to all 15 movies and 5 series — defaults apply only to *newly*
+  added content, existing rows need an explicit `POST /api/movies` /
+  `POST /api/series` with `radarrid`/`seriesid` + `profileid`;
+- refreshed the OpenSubtitles.com credentials.
+
+Result: provider status `Good`, wanted list down from 6 movies to 1
+(Interstellar, Ukrainian). Ukrainian subtitles arrived for Kiki's Delivery
+Service, Despicable Me 1 & 2 and LOTR, English for My Neighbors the Yamadas.
+Arrietty needed nothing — Bazarr correctly saw the Ukrainian and English tracks
+already embedded in the toloka rip.
+
+**Two API traps**, both of which fail unhelpfully:
+
+- Booleans must be lowercase `"true"` / `"false"`. `save_settings` compares
+  `value == 'true'` literally, so `"True"` stays a string and dynaconf rejects
+  it: `406 … must is_type_of <class 'bool'>`.
+- Each profile item needs **`audio_only_include`** alongside `audio_exclude`,
+  `hi`, `forced`, `language`. Omit it and assigning the profile dies with a
+  `500` / `KeyError: 'audio_only_include'` from the indexer — *after* writing
+  the first row, so the batch fails half-applied.
+
+Note: one grabbed track is **HI** (hearing-impaired) despite the profile asking
+for `hi: "False"` — Bazarr falls back to HI when no plain track exists.
