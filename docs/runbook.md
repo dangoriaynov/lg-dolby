@@ -313,6 +313,49 @@ Log: `/opt/media-stack/logs/grab.log`. Cron entry inside the LXC:
 The wrapper re-uploads `scripts/grab.py` to `/opt/media-stack/grab.py` on every
 run, so the repo stays the source of truth and cron never runs a stale copy.
 
+### 6.2 `grab subs` — Ukrainian subtitles by local translation
+
+When a film has no Ukrainian subtitles anywhere (OpenSubtitles included), the
+remaining option is to translate the English ones. `./grab subs "<film>"` does
+it end to end: fetches the best-scoring English SRT through Bazarr if the folder
+has none, translates it with the **local** `llama-server` in the `llm` LXC
+(nothing leaves the box), writes `<file>.uk.srt` beside the video, then tells
+Bazarr to rescan and Jellyfin to refresh so the track shows up on the TV.
+
+Match the film by its **Radarr title** (`grab subs arrietty`), not the Ukrainian
+one — release search goes to trackers, where titles are Ukrainian, but this
+matches against Radarr/TMDB titles, which are English.
+
+The translator is `scripts/subs-translate.py`; it can also be run directly:
+
+```bash
+python3 /opt/media-stack/subs-translate.py <file.en.srt>            # translate
+python3 /opt/media-stack/subs-translate.py <file.en.srt> --repair <file.uk.srt>
+```
+
+Design points that matter, learned on *Panda! Go Panda!* (832 cues, 168 s):
+
+- **Timecodes are never touched.** Only the text between them is translated and
+  the timing lines are copied verbatim, so the result is exactly as synced as
+  the source — desync is structurally impossible.
+- **Length is enforced.** The model must return exactly as many lines as it got.
+  On mismatch the batch is retried, then split in half, then done line by line.
+  This run needed 14 retries and 3 splits — every one silently self-healed. A
+  single lost line would shift every later subtitle.
+- **`enable_thinking: false`** in `chat_template_kwargs` is worth 16×: gemma
+  otherwise writes a long reasoning chain into `reasoning_content` (3.2 s vs
+  0.2 s per line — hours instead of minutes for a film).
+- **Consistency pass.** Batches are translated independently, so a repeated line
+  (song refrains especially) comes out slightly different each time. After
+  translating, every repeated source line is collapsed to one agreed rendering —
+  17 of them on this film.
+- A glossary of recurring names is fixed once up front, so a character doesn't
+  change name between scenes.
+
+Quality caveat: this is machine translation with a good harness, not a human
+translator. It reads naturally and is worth watching, but expect the occasional
+gender-agreement slip (one here: a neuter noun given a masculine adjective).
+
 **Manual fallback** (only if `grab` itself is broken): download the `.torrent`
 from toloka.to while logged in → qBittorrent UI `http://192.168.1.216:8085` →
 add, saves under `/data/torrents`, **leave the category empty** → Radarr →

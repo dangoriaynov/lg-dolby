@@ -9,6 +9,7 @@
     grab 0                   взяти реліз №0 з останнього пошуку
     grab 0 --to movie:25     те саме, але з явною прив'язкою до фільму Radarr
     grab finish              доімпортувати все, що докачалось (cron робить це сам)
+    grab subs <фільм>        українські субтитри: взяти англійські й перекласти локально
     grab import <part> --to movie:25   ручний імпорт торента, що вже лежить у qB
 
 Навіщо: Radarr шукає за англійською назвою з TMDB, а на toloka релізи названі
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import unicodedata
@@ -34,8 +36,13 @@ import urllib.request
 CONFIG_ROOT = "/opt/media-stack/config"
 STATE_PATH = "/opt/media-stack/grab-state.json"
 LOCK_PATH = "/opt/media-stack/grab.lock"
+TRANSLATOR = "/opt/media-stack/subs-translate.py"
+# Те саме роздвоєння шляхів, що і в torrent_content: /data/... бачать лише
+# контейнери, а grab виконується на LXC.
+HOST_DATA = "/opt/media-stack/data"
 TORRENT_DIR = "/data/torrents"
 
+BAZARR = "http://127.0.0.1:6767"
 RADARR = "http://127.0.0.1:7878"
 SONARR = "http://127.0.0.1:8989"
 PROWLARR = "http://127.0.0.1:9696"
@@ -65,6 +72,17 @@ def arr_key(service):
 def seerr_settings():
     with open(os.path.join(CONFIG_ROOT, "jellyseerr", "settings.json"), encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def bazarr_key():
+    path = os.path.join(CONFIG_ROOT, "bazarr", "config", "config.yaml")
+    with open(path, encoding="utf-8") as fh:
+        return re.search(r"apikey:\s*(\S+)", fh.read()).group(1)
+
+
+def on_lxc(container_path):
+    """Шлях у namespace контейнера → шлях, видимий grab'у на LXC."""
+    return container_path.replace("/data/", HOST_DATA + "/", 1)
 
 
 def qb_creds():
@@ -660,6 +678,101 @@ def cmd_import(part, to_spec, state):
     return cmd_finish(state)
 
 
+def bazarr_form(path, pairs, method="POST"):
+    body = urllib.parse.urlencode(list(pairs), doseq=True).encode()
+    req = urllib.request.Request(BAZARR + path, data=body, method=method,
+                                 headers={"X-API-KEY": bazarr_key(),
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        return resp.status
+
+
+def fetch_english_srt(movie_id, folder):
+    """Попросити Bazarr завантажити найкращі англійські субтитри."""
+    key = bazarr_key()
+    found = api(BAZARR + "/api/providers/movies?radarrid=%d" % movie_id, key,
+                timeout=600, header="X-API-KEY") or {}
+    data = found.get("data", found if isinstance(found, list) else [])
+    # Bazarr віддає ці прапорці рядками "True"/"False", не булевими.
+    english = [d for d in data
+               if (d.get("language") or "").lower().startswith("en")
+               and str(d.get("hearing_impaired")).lower() == "false"]
+    english.sort(key=lambda d: -(d.get("score") or 0))
+    if not english:
+        return None
+    best = english[0]
+    print("   англійські субтитри: score %s від %s" % (best.get("score"), best.get("provider")))
+    # OpenSubtitles регулярно рве першу спробу (RemoteDisconnected), а Bazarr
+    # усе одно відповідає 204 — тому дивимось на диск, а не на код відповіді,
+    # і пробуємо двічі.
+    for attempt in range(2):
+        bazarr_form("/api/providers/movies", [
+            ("radarrid", movie_id), ("hi", "False"), ("forced", "False"),
+            ("original_format", "False"), ("provider", best.get("provider")),
+            ("subtitle", best.get("subtitle")),
+        ])
+        for _ in range(20):
+            time.sleep(3)
+            hit = [f for f in os.listdir(folder) if f.lower().endswith(".en.srt")]
+            if hit:
+                return os.path.join(folder, hit[0])
+        if attempt == 0:
+            print("   провайдер не віддав файл — друга спроба")
+    return None
+
+
+def cmd_subs(query, state):
+    """Знайти фільм, дістати англійські субтитри й перекласти їх українською."""
+    movies = [c for c in candidates() if c["kind"] == "movie" and c["have"]]
+    needle = normalize(query)
+    # Шукаємо по всіх назвах із TMDB, а не лише по основній: у Radarr вона
+    # англійська, а користувач природно пише українською ("аріетті").
+    hits = [m for m in movies if any(needle in normalize(t) for t in m["titles"])]
+    if not hits:
+        hits = [m for m in movies
+                if any(tokens(query) & tokens(t) for t in m["titles"] if tokens(t))]
+    if not hits:
+        raise SystemExit("Не знайшов фільму з файлом за запитом %r." % query)
+    if len(hits) > 1:
+        print("Підходить кілька — уточни запит:")
+        for m in hits[:10]:
+            print("   %s (%s)" % (m["title"], m["year"]))
+        return 1
+
+    movie = hits[0]
+    folder = on_lxc(movie["path"])
+    if not os.path.isdir(folder):
+        raise SystemExit("Тека фільму не знайдена: %s" % folder)
+    print("фільм: %s (%s)" % (movie["title"], movie["year"]))
+
+    if [f for f in os.listdir(folder) if f.lower().endswith(".uk.srt")]:
+        print("   українські субтитри вже є — нічого не роблю")
+        return 0
+
+    english = [f for f in os.listdir(folder) if f.lower().endswith(".en.srt")]
+    path = os.path.join(folder, english[0]) if english else fetch_english_srt(movie["id"], folder)
+    if not path:
+        raise SystemExit("Англійських субтитрів немає ні на диску, ні в провайдерів — "
+                         "перекладати нема з чого.")
+
+    print("   перекладаю %s" % os.path.basename(path))
+    code = subprocess.call(["python3", TRANSLATOR, path])
+    if code != 0:
+        raise SystemExit("переклад не вдався (код %d)" % code)
+
+    # хай Bazarr зарахує мову, а Jellyfin покаже доріжку
+    bazarr_form("/api/movies", [("radarrid", movie["id"]), ("action", "scan-disk")],
+                method="PATCH")
+    settings = seerr_settings()
+    try:
+        api(JELLYFIN + "/Library/Refresh", settings["jellyfin"]["apiKey"],
+            method="POST", data={}, header="X-Emby-Token", timeout=60)
+    except urllib.error.HTTPError as exc:
+        print("   ! Jellyfin refresh: %s" % exc)
+    print("   готово — Bazarr і Jellyfin оновлені")
+    return 0
+
+
 def cmd_status(state):
     settings = seerr_settings()
     qb = QBit()
@@ -742,6 +855,10 @@ def main():
         return cmd_finish(state, quiet=opts.quiet)
     if head in ("status", "pending", "s"):
         return cmd_status(state)
+    if head == "subs":
+        if len(argv) < 2:
+            raise SystemExit("Використання: grab subs <назва фільму>")
+        return cmd_subs(" ".join(argv[1:]), state)
     if head == "import":
         if len(argv) < 2 or not opts.to:
             raise SystemExit("Використання: grab import <частина назви> --to movie:<id>")

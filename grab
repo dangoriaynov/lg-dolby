@@ -19,8 +19,11 @@ for arg in "$@"; do
   quoted+=" '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
 done
 
-exec ssh -o ConnectTimeout=20 "$HOST" \
-  "cat > /tmp/grab.py \
-   && lxc file push --quiet /tmp/grab.py media-server/opt/media-stack/grab.py \
-   && lxc exec media-server -- python3 /opt/media-stack/grab.py${quoted}" \
-  < "$DIR/scripts/grab.py"
+# Заливаємо обидва скрипти одним потоком: grab.py смикає subs-translate.py,
+# і розʼїхатись у версіях вони не мають.
+# Архів приймає stdin самого `lxc exec` — без `lxc file push`, який LXD тут
+# відхиляє (Error: Forbidden). Одне зʼєднання: розпакували й одразу запустили.
+tar -C "$DIR" -cf - scripts/grab.py scripts/subs-translate.py | ssh -o ConnectTimeout=20 "$HOST" \
+  "cat > /tmp/grab.tar \
+   && lxc exec media-server -- tar -xf - -C /opt/media-stack --strip-components=1 < /tmp/grab.tar \
+   && lxc exec media-server -- python3 /opt/media-stack/grab.py${quoted}"
