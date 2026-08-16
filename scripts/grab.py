@@ -95,6 +95,35 @@ def api(url, key, method="GET", data=None, timeout=300, header="X-Api-Key"):
     return json.loads(raw) if raw else None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch_release(url):
+    """('magnet', uri) або ('torrent', bytes) за посиланням Prowlarr.
+
+    Тягне саме grab, а не qBittorrent: посилання Prowlarr вказує на
+    127.0.0.1:9696, а всередині контейнера qB це вже сам qB. Індексери на кшталт
+    Nyaa віддають лише магнет — Prowlarr тоді відповідає 301 на `magnet:`, який
+    urllib за редіректом пройти не вміє, тому Location читаємо вручну.
+    """
+    if url.startswith("magnet:"):
+        return "magnet", url
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(url, timeout=120) as resp:
+            blob = resp.read()
+    except urllib.error.HTTPError as exc:
+        location = (exc.headers.get("Location") or "") if exc.headers else ""
+        if 300 <= exc.code < 400 and location.startswith("magnet:"):
+            return "magnet", location
+        raise
+    if blob[:1] != b"d":
+        raise SystemExit("Prowlarr віддав не .torrent (%r…) — перевір індексер." % blob[:40])
+    return "torrent", blob
+
+
 class QBit:
     def __init__(self):
         user, password = qb_creds()
@@ -374,18 +403,16 @@ def cmd_get(index, to_spec, state):
     qb = QBit()
     before = {t["hash"] for t in qb.torrents()}
 
-    if row.get("downloadUrl"):
-        # Prowlarr проксує завантаження .torrent зі своїми кукі до toloka,
-        # тому окремий логін на трекері не потрібен.
-        with urllib.request.urlopen(row["downloadUrl"], timeout=120) as resp:
-            blob = resp.read()
-        if blob[:1] != b"d":
-            raise SystemExit("Prowlarr віддав не .torrent (%r…) — перевір індексер." % blob[:40])
-        qb.add_file(blob, "grab-%d.torrent" % index)
-    elif row.get("magnetUrl"):
-        qb.add_url(row["magnetUrl"])
-    else:
+    # Prowlarr проксує завантаження зі своїми кукі до трекера, тому окремий
+    # логін на toloka не потрібен.
+    link = row.get("downloadUrl") or row.get("magnetUrl")
+    if not link:
         raise SystemExit("У релізу немає ні downloadUrl, ні magnet.")
+    kind, payload = fetch_release(link)
+    if kind == "magnet":
+        qb.add_url(payload)
+    else:
+        qb.add_file(payload, "grab-%d.torrent" % index)
 
     new_hash, name = None, row["title"]
     for _ in range(20):

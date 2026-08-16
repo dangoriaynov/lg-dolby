@@ -267,7 +267,11 @@ fixed — the search has to be done with a different query.
 
 1. Searches **Prowlarr** `/api/v1/search?query=…`. Prowlarr proxies the
    `.torrent` download with its own tracker credentials, so no toloka login and
-   no hand-downloaded `.torrent` file is needed.
+   no hand-downloaded `.torrent` file is needed. The link is fetched by *grab*,
+   never handed to qBittorrent — it points at `127.0.0.1:9696`, which inside the
+   qB container is qB itself. Magnet-only indexers (Nyaa) make Prowlarr answer
+   `301 → magnet:`, which urllib won't follow, so the `Location` header is read
+   directly and the magnet goes to qB as a URL instead of a file.
 2. Guesses the target request by matching the release title against every
    Radarr/Sonarr title, `originalTitle` **and TMDB `alternateTitles`** — that's
    what makes `Мої сусіди Ямада / Tonari no Yamada-kun (1999)` resolve to
@@ -518,11 +522,18 @@ the upgrade — both predate it):
 1. **RuTracker is dead in Prowlarr.** `[403:Forbidden] POST
    https://rutracker.org/forum/login.php`, and the response body is a Cloudflare
    *"Just a moment…"* interstitial — bot protection, not bad credentials. Prowlarr
-   cannot solve a JS challenge on its own; the usual fix is a **FlareSolverr**
-   container added as a Prowlarr proxy. Until then **Toloka.to is effectively the
-   only working indexer** (which is why §6.1 searches only ever return toloka
-   results). Radarr/Sonarr show this as "Indexers unavailable due to failures for
-   more than 6 hours".
+   cannot solve a JS challenge on its own; the fix would be a **FlareSolverr**
+   container (headless Chrome) attached as a Prowlarr *indexer proxy* via a tag,
+   so only RuTracker routes through it. Deliberately **not** done: RuTracker is
+   Russian-language, and the goal here is Ukrainian dubs. Radarr/Sonarr surface
+   this as "Indexers unavailable due to failures for more than 6 hours".
+   **Nyaa.si was added instead** (2026-08-16, public, no account, indexer id 3):
+   it covers obscure anime Toloka doesn't have — e.g. *Panda! Go Panda!* (1972),
+   5 releases — but with Japanese audio and English subs, so it complements
+   Toloka rather than replacing it. Of the 621 indexer definitions Prowlarr
+   ships, exactly **four are uk-UA**: Toloka.to and Mazepa (both semi-private,
+   free registration) plus 0day.kiev and UTOPIA (invite-only). Mazepa is the
+   only realistic way to widen the *Ukrainian* catalogue.
 2. **Bazarr has never downloaded a subtitle.** `enabled_providers: []`, no
    language profiles, `movie_default_enabled: false` / `serie_default_enabled:
    false` — it is wired to Radarr/Sonarr and does nothing. Not urgent in practice:
