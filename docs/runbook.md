@@ -289,13 +289,17 @@ fixed — the search has to be done with a different query.
    names in qB are relative to `save_path`, so the torrent's own folder and its
    file list are derived from there — and files with priority 0 or progress < 1
    are dropped, which matters for packs where only some seasons were selected.
-5. `grab finish` (cron, `*/5`) runs ManualImport with **importMode `copy`**
+5. Picks the file by **year first, size second**. A torrent can hold more than
+   one film — *Panda! Go Panda!* ships the 1972 original together with the 1973
+   sequel, and the sequel is the larger file — so "largest wins" would import
+   the wrong movie.
+6. `grab finish` (cron, `*/5`) runs ManualImport with **importMode `copy`**
    (= hardlink, the torrent keeps seeding), an explicit `movieId`/`episodeIds`,
    and an explicit quality — parsed from the release name when Radarr reports
    `Unknown`, so files don't land at Unknown quality and confuse upgrade logic.
    Note toloka writes `1080р` with a **Cyrillic р**; the parser normalises
    homoglyphs before matching.
-6. Then pings Jellyfin `POST /Library/Refresh` and runs the Seerr jobs
+7. Then pings Jellyfin `POST /Library/Refresh` and runs the Seerr jobs
    `jellyfin-recently-added-scan` + `availability-sync`, so the play button
    appears without waiting for a periodic scan.
 

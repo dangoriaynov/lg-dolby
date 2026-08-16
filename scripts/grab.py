@@ -486,7 +486,12 @@ def import_movie(entry, torrent, table, qb):
     rows = [r for r in rows if r.get("path") in set(paths)]
     if not rows:
         return False, "Radarr не побачив відеофайлів роздачі у %s" % folder
-    row = max(rows, key=lambda r: r.get("size") or 0)
+    # Роздача може містити кілька фільмів (напр. "Panda! Go Panda!" 1972 разом із
+    # продовженням 1973-го). Найбільший файл тоді — не той: спершу шукаємо той,
+    # що збігається роком, і лише як запасний варіант беремо найбільший.
+    year = str(entry["target"].get("year") or "")
+    by_year = [r for r in rows if year and year in os.path.basename(r["path"])]
+    row = max(by_year or rows, key=lambda r: r.get("size") or 0)
 
     # Назва релізу на трекері авторитетніша за ім'я файлу: "My.Neighbors.the.
     # Yamadas.1999(Artymko).mkv" не містить джерела, і Radarr здогадується по
