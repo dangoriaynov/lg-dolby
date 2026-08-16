@@ -111,6 +111,11 @@ class QBit:
         raw = self.opener.open(QBIT + "/api/v2/torrents/info", timeout=60).read()
         return json.loads(raw)
 
+    def files(self, torrent_hash):
+        raw = self.opener.open(
+            QBIT + "/api/v2/torrents/files?hash=%s" % torrent_hash, timeout=60).read()
+        return json.loads(raw)
+
     def add_file(self, blob, filename, savepath=TORRENT_DIR):
         """Кладемо .torrent як multipart. Категорію НЕ ставимо навмисно: торент з
         категорією `radarr` Radarr спробує імпортувати сам, не зможе розпарсити
@@ -407,21 +412,39 @@ def cmd_get(index, to_spec, state):
     return 0
 
 
-def import_movie(entry, torrent, table):
+def torrent_content(qb, torrent):
+    """Тека роздачі + абсолютні шляхи докачаних відеофайлів (у namespace контейнерів).
+
+    os.path.isdir() тут використати не можна: шляхи виду /data/... існують лише
+    всередині контейнерів, а grab працює на LXC — перевірка завжди дала б False
+    і для роздачі-теки в *arr пішов би батьківський /data/torrents, після чого
+    сканується весь каталог, а файли роздачі не знаходяться. Структуру тому
+    беремо з самого qBittorrent: імена файлів у ньому відносні до save_path.
+    Невибрані (priority 0) і недокачані файли відкидаємо — у сезонних паках
+    часто завантажена лише частина.
+    """
+    files = qb.files(torrent["hash"])
+    save = torrent["save_path"].rstrip("/")
+    nested = any("/" in f["name"] for f in files)
+    root = os.path.join(save, files[0]["name"].split("/")[0]) if nested else save
+    paths = [os.path.join(save, f["name"]) for f in files
+             if f.get("priority", 1) != 0 and f.get("progress", 0) >= 1
+             and f["name"].lower().endswith(VIDEO_EXT)]
+    return root, paths
+
+
+def import_movie(entry, torrent, table, qb):
     key = arr_key("radarr")
-    folder = torrent["content_path"]
-    if not os.path.isdir(folder):
-        folder = os.path.dirname(folder) or TORRENT_DIR
+    folder, paths = torrent_content(qb, torrent)
+    if not paths:
+        return False, "у роздачі немає докачаних відеофайлів"
     url = RADARR + "/api/v3/manualimport?" + urllib.parse.urlencode(
         {"folder": folder, "filterExistingFiles": "false"})
     rows = api(url, key, timeout=600) or []
 
-    wanted = torrent["content_path"]
-    rows = [r for r in rows
-            if (r.get("path") == wanted or r.get("path", "").startswith(wanted.rstrip("/") + "/"))
-            and r.get("path", "").lower().endswith(VIDEO_EXT)]
+    rows = [r for r in rows if r.get("path") in set(paths)]
     if not rows:
-        return False, "Radarr не побачив відеофайлів у %s" % wanted
+        return False, "Radarr не побачив відеофайлів роздачі у %s" % folder
     row = max(rows, key=lambda r: r.get("size") or 0)
 
     # Назва релізу на трекері авторитетніша за ім'я файлу: "My.Neighbors.the.
@@ -450,21 +473,18 @@ def import_movie(entry, torrent, table):
     return True, movie["movieFile"]["relativePath"]
 
 
-def import_series(entry, torrent, table):
+def import_series(entry, torrent, table, qb):
     key = arr_key("sonarr")
-    folder = torrent["content_path"]
-    if not os.path.isdir(folder):
-        folder = os.path.dirname(folder) or TORRENT_DIR
+    folder, paths = torrent_content(qb, torrent)
+    if not paths:
+        return False, "у роздачі немає докачаних відеофайлів"
     url = SONARR + "/api/v3/manualimport?" + urllib.parse.urlencode(
         {"folder": folder, "seriesId": entry["target"]["id"], "filterExistingFiles": "false"})
     rows = api(url, key, timeout=600) or []
 
-    wanted = torrent["content_path"]
-    rows = [r for r in rows
-            if (r.get("path") == wanted or r.get("path", "").startswith(wanted.rstrip("/") + "/"))
-            and r.get("path", "").lower().endswith(VIDEO_EXT)]
+    rows = [r for r in rows if r.get("path") in set(paths)]
     if not rows:
-        return False, "Sonarr не побачив відеофайлів у %s" % wanted
+        return False, "Sonarr не побачив відеофайлів роздачі у %s" % folder
 
     files, skipped = [], []
     for row in rows:
@@ -553,7 +573,7 @@ def cmd_finish(state, quiet=False):
             tables[kind] = quality_table(base, key)
         worker = import_movie if kind == "movie" else import_series
         try:
-            ok, note = worker(entry, torrent, tables[kind])
+            ok, note = worker(entry, torrent, tables[kind], qb)
         except Exception as exc:  # мережа/API — лишаємо в черзі на наступний прогін
             print("! %s — імпорт впав: %s" % (entry["name"][:60], exc))
             continue

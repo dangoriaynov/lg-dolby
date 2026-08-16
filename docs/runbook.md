@@ -278,13 +278,20 @@ fixed — the search has to be done with a different query.
    can't match the Ukrainian name and leaves a stuck "Unknown Movie" queue row —
    the §7 failure mode. The binding to the request is carried by the explicit
    `movieId`/`seriesId` in the state file, not by the category.
-4. `grab finish` (cron, `*/5`) runs ManualImport with **importMode `copy`**
+4. Works out *what* to import from qBittorrent's own file list, never from the
+   filesystem: paths like `/data/torrents/…` exist only inside the containers,
+   so `os.path.isdir()` on the LXC is always False and a season pack would be
+   handed to Sonarr as the parent `/data/torrents` (which finds nothing). File
+   names in qB are relative to `save_path`, so the torrent's own folder and its
+   file list are derived from there — and files with priority 0 or progress < 1
+   are dropped, which matters for packs where only some seasons were selected.
+5. `grab finish` (cron, `*/5`) runs ManualImport with **importMode `copy`**
    (= hardlink, the torrent keeps seeding), an explicit `movieId`/`episodeIds`,
    and an explicit quality — parsed from the release name when Radarr reports
    `Unknown`, so files don't land at Unknown quality and confuse upgrade logic.
    Note toloka writes `1080р` with a **Cyrillic р**; the parser normalises
    homoglyphs before matching.
-5. Then pings Jellyfin `POST /Library/Refresh` and runs the Seerr jobs
+6. Then pings Jellyfin `POST /Library/Refresh` and runs the Seerr jobs
    `jellyfin-recently-added-scan` + `availability-sync`, so the play button
    appears without waiting for a periodic scan.
 
