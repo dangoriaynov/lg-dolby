@@ -542,10 +542,4 @@ the upgrade — both predate it):
    a primary source. Because `grab` sorts by seeders and collapses duplicates by
    exact byte size (keeping the best-seeded copy and annotating
    "також: Mazepa"), the mirror rows never crowd the picker.
-2. **Bazarr has never downloaded a subtitle.** `enabled_providers: []`, no
-   language profiles, `movie_default_enabled: false` / `serie_default_enabled:
-   false` — it is wired to Radarr/Sonarr and does nothing. Not urgent in practice:
-   the toloka rips carry embedded Ukrainian subtitle tracks, which Jellyfin reads
-   directly. To actually turn it on you need a provider account (OpenSubtitles.com)
-   or an account-free provider, plus a Ukrainian+English profile set as the
-   default for both movies and series.
+2. **Bazarr had never downloaded a subtitle** — fixed the same day, see §9.1.
