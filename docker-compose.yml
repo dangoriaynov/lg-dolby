@@ -5,6 +5,20 @@
 # every container still reports "healthy". Pinning the app version still picks
 # up base-image rebuilds of that version. To upgrade: bump the tag here, then
 # `docker compose pull && docker compose up -d` — never the other way round.
+#
+# Ports: only Jellyfin and Seerr (both behind their own login) listen on every
+# address of the LXC, so they stay reachable from the VPN as well as the LAN.
+# Everything else is bound to 127.0.0.1: the LXC's eth0 sits on the LXD bridge,
+# which every other container and every VPN peer can reach, and the *arr apps
+# and qBittorrent can be set to skip their login for "local" (private)
+# addresses. The LXD proxy devices and ./grab connect to 127.0.0.1, and the
+# services reach each other by name on media-net.
+x-hardening: &hardening
+  # No privilege gain through setuid binaries inside the containers;
+  # linuxserver's s6 drops to PUID/PGID with setuid(), which this does not block.
+  security_opt:
+    - no-new-privileges:true
+
 services:
 
   # ============================================================
@@ -16,6 +30,7 @@ services:
   # any transcode falls back to CPU. See docs/runbook.md (2026-06-21 incident).
   # ============================================================
   jellyfin:
+    <<: *hardening
     image: jellyfin/jellyfin:10.11.11
     container_name: jellyfin
     environment:
@@ -26,9 +41,6 @@ services:
       - ${DATA_PATH}/media:/data/media:ro  # read-only: Jellyfin only reads media
     ports:
       - "8096:8096"
-      # DLNA (optional, for LG TV built-in player fallback)
-      - "1900:1900/udp"
-      - "7359:7359/udp"
     restart: unless-stopped
     networks:
       - media-net
@@ -39,6 +51,7 @@ services:
   # Default login: admin / (check logs: docker logs qbittorrent)
   # ============================================================
   qbittorrent:
+    <<: *hardening
     image: lscr.io/linuxserver/qbittorrent:5.2.3
     container_name: qbittorrent
     environment:
@@ -50,9 +63,9 @@ services:
       - ${CONFIG_PATH}/qbittorrent:/config
       - ${DATA_PATH}:/data  # Full /data access for downloads
     ports:
-      - "8085:8085"
-      - "6881:6881"
-      - "6881:6881/udp"
+      - "127.0.0.1:8085:8085"
+      - "127.0.0.1:6881:6881"
+      - "127.0.0.1:6881:6881/udp"
     restart: unless-stopped
     networks:
       - media-net
@@ -62,6 +75,7 @@ services:
   # Access: http://<server-ip>:9696
   # ============================================================
   prowlarr:
+    <<: *hardening
     image: lscr.io/linuxserver/prowlarr:2.5.2
     container_name: prowlarr
     environment:
@@ -71,7 +85,7 @@ services:
     volumes:
       - ${CONFIG_PATH}/prowlarr:/config
     ports:
-      - "9696:9696"
+      - "127.0.0.1:9696:9696"
     restart: unless-stopped
     networks:
       - media-net
@@ -81,6 +95,7 @@ services:
   # Access: http://<server-ip>:7878
   # ============================================================
   radarr:
+    <<: *hardening
     image: lscr.io/linuxserver/radarr:6.3.0
     container_name: radarr
     environment:
@@ -91,7 +106,7 @@ services:
       - ${CONFIG_PATH}/radarr:/config
       - ${DATA_PATH}:/data  # Same /data mount — enables hardlinks
     ports:
-      - "7878:7878"
+      - "127.0.0.1:7878:7878"
     restart: unless-stopped
     networks:
       - media-net
@@ -101,6 +116,7 @@ services:
   # Access: http://<server-ip>:8989
   # ============================================================
   sonarr:
+    <<: *hardening
     image: lscr.io/linuxserver/sonarr:4.0.19
     container_name: sonarr
     environment:
@@ -111,7 +127,7 @@ services:
       - ${CONFIG_PATH}/sonarr:/config
       - ${DATA_PATH}:/data  # Same /data mount — enables hardlinks
     ports:
-      - "8989:8989"
+      - "127.0.0.1:8989:8989"
     restart: unless-stopped
     networks:
       - media-net
@@ -121,6 +137,7 @@ services:
   # Access: http://<server-ip>:6767
   # ============================================================
   bazarr:
+    <<: *hardening
     image: lscr.io/linuxserver/bazarr:1.6.0
     container_name: bazarr
     environment:
@@ -131,7 +148,7 @@ services:
       - ${CONFIG_PATH}/bazarr:/config
       - ${DATA_PATH}/media:/data/media  # Needs access to media for subtitle matching
     ports:
-      - "6767:6767"
+      - "127.0.0.1:6767:6767"
     restart: unless-stopped
     networks:
       - media-net
@@ -141,6 +158,7 @@ services:
   # Access: http://<server-ip>:5055
   # ============================================================
   jellyseerr:
+    <<: *hardening
     image: ghcr.io/seerr-team/seerr:v3.4.1
     container_name: jellyseerr
     environment:

@@ -4,13 +4,12 @@ set -euo pipefail
 # =============================================================================
 # Media Server Setup Script — Run INSIDE the LXC container
 #
-# Installs Docker + NVIDIA Container Toolkit, creates directory structure,
-# and launches the full stack:
-#   Jellyfin (NVENC), qBittorrent, Prowlarr, Radarr, Sonarr, Bazarr, Jellyseerr
+# Installs Docker, creates directory structure, and launches the full stack:
+#   Jellyfin (CPU), qBittorrent, Prowlarr, Radarr, Sonarr, Bazarr, Jellyseerr
 #
-# Prerequisites:
-#   - LXC container created by host-setup.sh with GPU passthrough
-#   - NVIDIA GPU visible (nvidia-smi works)
+# The GPU belongs to the `llm` container (docs/runbook.md §2), so the NVIDIA
+# Container Toolkit is installed only when a GPU was passed in on purpose
+# (host-setup.sh with WITH_GPU=1).
 #
 # Usage: sudo bash setup.sh
 # =============================================================================
@@ -31,7 +30,17 @@ if [ "$EUID" -ne 0 ]; then
     err "Please run as root: sudo bash setup.sh"
 fi
 
-REAL_USER="${SUDO_USER:-$USER}"
+# The containers run as PUID/PGID. Run through `lxc exec` there is no SUDO_USER
+# and $USER is root, which would hand every service (the torrent client among
+# them) uid 0 — so fall back to a dedicated unprivileged account instead.
+REAL_USER="${SUDO_USER:-${USER:-root}}"
+if [ "$REAL_USER" = "root" ]; then
+    REAL_USER="media"
+    if ! id -u "$REAL_USER" &> /dev/null; then
+        useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$REAL_USER"
+        log "Created system user '$REAL_USER' for the containers"
+    fi
+fi
 REAL_UID=$(id -u "$REAL_USER")
 REAL_GID=$(id -g "$REAL_USER")
 
@@ -43,14 +52,17 @@ echo " IP:   $SERVER_IP"
 echo "========================================"
 echo ""
 
-# --- Step 1: Verify NVIDIA GPU access ---
-echo "--- Step 1: Verifying NVIDIA GPU ---"
+# --- Step 1: Is there a GPU on purpose? ---
+echo "--- Step 1: Checking for a passed-through GPU ---"
 
+HAS_GPU=false
 if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    HAS_GPU=true
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-    log "NVIDIA GPU detected: $GPU_NAME"
+    warn "NVIDIA GPU visible: $GPU_NAME — installing the container toolkit for it."
+    warn "Policy is no GPU here (docs/runbook.md §2); Jellyfin still runs without it."
 else
-    err "nvidia-smi not working. Ensure host-setup.sh was run and GPU is passed through."
+    log "No GPU in this container — Jellyfin transcodes on CPU (expected)."
 fi
 
 # --- Step 2: Install Docker ---
@@ -72,7 +84,11 @@ else
     apt-get update
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-    usermod -aG docker "$REAL_USER" 2>/dev/null || true
+    # Only a person who ran sudo gets the docker group (= root); never the
+    # service account the containers run as.
+    if [ -n "${SUDO_USER:-}" ]; then
+        usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+    fi
     log "Docker installed."
 fi
 
@@ -82,63 +98,67 @@ if ! docker compose version &> /dev/null; then
 fi
 log "Docker Compose: $(docker compose version --short)"
 
-# --- Step 3: Install NVIDIA Container Toolkit ---
-echo ""
-echo "--- Step 3: Installing NVIDIA Container Toolkit ---"
+if [ "$HAS_GPU" = true ]; then
+    # --- Step 3: Install NVIDIA Container Toolkit ---
+    echo ""
+    echo "--- Step 3: Installing NVIDIA Container Toolkit ---"
 
-if dpkg -l | grep -q nvidia-container-toolkit; then
-    log "NVIDIA Container Toolkit already installed"
-else
-    # Add NVIDIA container toolkit repo
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-        gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-    apt-get update
-    apt-get install -y nvidia-container-toolkit
-    log "NVIDIA Container Toolkit installed"
-fi
-
-# Configure nvidia-container-runtime for LXC (no-cgroups required for unprivileged containers)
-NVIDIA_CONFIG="/etc/nvidia-container-runtime/config.toml"
-if [ -f "$NVIDIA_CONFIG" ]; then
-    if grep -q "^no-cgroups" "$NVIDIA_CONFIG"; then
-        sed -i 's/^no-cgroups.*/no-cgroups = true/' "$NVIDIA_CONFIG"
-    elif grep -q "#no-cgroups" "$NVIDIA_CONFIG"; then
-        sed -i 's/#no-cgroups.*/no-cgroups = true/' "$NVIDIA_CONFIG"
+    # dpkg -s, not `dpkg -l | grep -q`: under pipefail grep -q closing the pipe early
+    # fails the pipeline exactly when the package is there.
+    if dpkg -s nvidia-container-toolkit &> /dev/null; then
+        log "NVIDIA Container Toolkit already installed"
     else
-        echo "no-cgroups = true" >> "$NVIDIA_CONFIG"
+        # Add NVIDIA container toolkit repo
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+            gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+            tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+        apt-get update
+        apt-get install -y nvidia-container-toolkit
+        log "NVIDIA Container Toolkit installed"
     fi
-else
-    mkdir -p /etc/nvidia-container-runtime
-    cat > "$NVIDIA_CONFIG" << 'TOML'
+
+    # Configure nvidia-container-runtime for LXC (no-cgroups required for unprivileged containers)
+    NVIDIA_CONFIG="/etc/nvidia-container-runtime/config.toml"
+    if [ -f "$NVIDIA_CONFIG" ]; then
+        if grep -q "^no-cgroups" "$NVIDIA_CONFIG"; then
+            sed -i 's/^no-cgroups.*/no-cgroups = true/' "$NVIDIA_CONFIG"
+        elif grep -q "#no-cgroups" "$NVIDIA_CONFIG"; then
+            sed -i 's/#no-cgroups.*/no-cgroups = true/' "$NVIDIA_CONFIG"
+        else
+            echo "no-cgroups = true" >> "$NVIDIA_CONFIG"
+        fi
+    else
+        mkdir -p /etc/nvidia-container-runtime
+        cat > "$NVIDIA_CONFIG" << 'TOML'
 [nvidia-container-cli]
 no-cgroups = true
 TOML
-fi
-log "NVIDIA Container Runtime configured (no-cgroups = true for LXC)"
+    fi
+    log "NVIDIA Container Runtime configured (no-cgroups = true for LXC)"
 
-# Register nvidia runtime with Docker
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-log "Docker configured with NVIDIA runtime"
+    # Register nvidia runtime with Docker
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+    log "Docker configured with NVIDIA runtime"
 
-# --- Step 4: Verify Docker can see GPU ---
-echo ""
-echo "--- Step 4: Testing Docker GPU access ---"
+    # --- Step 4: Verify Docker can see GPU ---
+    echo ""
+    echo "--- Step 4: Testing Docker GPU access ---"
 
-if docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi &> /dev/null; then
-    log "Docker GPU access verified!"
-else
-    warn "Docker GPU test failed. Trying alternative CUDA image..."
-    if docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi; then
-        log "Docker GPU access verified (via runtime flag)!"
+    if docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi &> /dev/null; then
+        log "Docker GPU access verified!"
     else
-        warn "GPU test container failed. Jellyfin may still work — continuing setup."
-        warn "You can debug later with: docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi"
+        warn "Docker GPU test failed. Trying alternative CUDA image..."
+        if docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi; then
+            log "Docker GPU access verified (via runtime flag)!"
+        else
+            warn "GPU test container failed. Jellyfin may still work — continuing setup."
+            warn "You can debug later with: docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi"
+        fi
     fi
 fi
 
@@ -201,18 +221,6 @@ echo ""
 log "All services started!"
 echo ""
 
-# --- Step 8: Verify GPU in Jellyfin container ---
-echo ""
-echo "--- Step 8: Verifying Jellyfin GPU access ---"
-
-sleep 3
-if docker exec jellyfin nvidia-smi &> /dev/null; then
-    log "Jellyfin container has GPU access — NVENC transcoding ready!"
-else
-    warn "Jellyfin cannot see GPU yet. Check with: docker exec jellyfin nvidia-smi"
-    warn "You may need to restart the container: docker restart jellyfin"
-fi
-
 # --- Summary ---
 echo ""
 echo "========================================"
@@ -220,16 +228,13 @@ echo " Setup Complete!"
 echo "========================================"
 echo ""
 echo " Server IP: $SERVER_IP"
-echo " GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown') (NVENC)"
+echo " Containers run as: $REAL_USER (UID=$REAL_UID)"
 echo ""
 echo " Service URLs:"
-echo "   Jellyfin:    http://$SERVER_IP:8096    (media server — select NVENC in Dashboard > Playback)"
+echo "   Jellyfin:    http://$SERVER_IP:8096    (media server — keep Hardware acceleration: None)"
 echo "   Jellyseerr:  http://$SERVER_IP:5055    (browse & request)"
-echo "   Radarr:      http://$SERVER_IP:7878    (movies)"
-echo "   Sonarr:      http://$SERVER_IP:8989    (TV shows)"
-echo "   Prowlarr:    http://$SERVER_IP:9696    (indexers)"
-echo "   qBittorrent: http://$SERVER_IP:8085    (torrents)"
-echo "   Bazarr:      http://$SERVER_IP:6767    (subtitles)"
+echo "   Radarr, Sonarr, Prowlarr, qBittorrent, Bazarr listen on 127.0.0.1 only;"
+echo "   open them for setup through a temporary LXD proxy (README, Step 4)."
 echo ""
 echo " Next steps (follow the plan in order):"
 echo "   1. qBittorrent: get temp password: docker logs qbittorrent 2>&1 | grep password"
@@ -237,13 +242,13 @@ echo "   2. Prowlarr:    add toloka.to indexer, connect to Radarr/Sonarr"
 echo "   3. Radarr:      set root folder /data/media/movies, add qBittorrent"
 echo "   4. Sonarr:      set root folder /data/media/tv, add qBittorrent"
 echo "   5. Bazarr:      configure Ukrainian + English subtitle providers"
-echo "   6. Jellyfin:    run setup wizard, add libraries, enable NVENC:"
-echo "                   Dashboard > Playback > Hardware Acceleration > Nvidia NVENC"
+echo "   6. Jellyfin:    run setup wizard, add libraries; leave Hardware Acceleration"
+echo "                   on None — there is no GPU here (docs/runbook.md §2)"
 echo "   7. Jellyseerr:  connect to Jellyfin, Radarr, Sonarr"
 echo "   8. LG TV:       install Jellyfin from LG Content Store, connect to http://$SERVER_IP:8096"
 echo ""
 
 # Remind about docker group
-if ! groups "$REAL_USER" 2>/dev/null | grep -q docker; then
+if [ -n "${SUDO_USER:-}" ] && ! groups "$SUDO_USER" 2>/dev/null | grep -q docker; then
     warn "Log out and back in (or run 'newgrp docker') for docker group to take effect."
 fi

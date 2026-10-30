@@ -29,6 +29,15 @@ lxc exec media-server -- bash -lc 'cd /opt/media-stack && docker compose ps'
 
 - Repo (this folder) is the **source of truth**. It deploys to
   `/opt/media-stack/docker-compose.yml` inside the `media-server` LXC.
+- Only Jellyfin (`:8096`) and Seerr (`:5055`) listen on every address of the
+  LXC. Radarr, Sonarr, Prowlarr, qBittorrent and Bazarr are published on the
+  LXC's `127.0.0.1` only (`docker-compose.yml`): the LXD bridge is shared with
+  every other container, and the host firewall (`hl_expo`) filters only
+  traffic from the VPN, not neighbours on the bridge. To open an admin UI from
+  the Mac, add a host-loopback proxy device and tunnel to it (README, Step 4):
+  `lxc config device add media-server proxy-radarr proxy listen=tcp:127.0.0.1:7878 connect=tcp:127.0.0.1:7878`,
+  then `ssh -N -L 7878:127.0.0.1:7878 danko@10.100.0.1` → `http://localhost:7878`.
+  Remove the device when done.
 - Jellyfin is published to the LAN as `http://192.168.1.216:8096`
   (`JELLYFIN_PublishedServerUrl`, via an LXD `proxy-jellyfin` device →
   `127.0.0.1:8096`). Jellyseerr reaches Jellyfin at that same address.
@@ -313,6 +322,25 @@ Log: `/opt/media-stack/logs/grab.log`. Cron entry inside the LXC:
 The wrapper re-uploads `scripts/grab.py` to `/opt/media-stack/grab.py` on every
 run, so the repo stays the source of truth and cron never runs a stale copy.
 
+Every command that changes the state file takes `/opt/media-stack/grab.lock`:
+cron's `finish` skips its run when the lock is busy, a manual `grab "…"`,
+`grab 0` or `grab import` waits for it — otherwise cron could write back an
+older copy of the state and drop a torrent you just added.
+
+The log grows by a line per import; rotate it inside the LXC
+(`/etc/logrotate.d/grab`):
+
+```
+/opt/media-stack/logs/grab.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
 ### 6.2 `grab subs` — Ukrainian subtitles by local translation
 
 When a film has no Ukrainian subtitles anywhere (OpenSubtitles included), the
@@ -325,6 +353,15 @@ Bazarr to rescan and Jellyfin to refresh so the track shows up on the TV.
 Match the film by its **Radarr title** (`grab subs arrietty`), not the Ukrainian
 one — release search goes to trackers, where titles are Ukrainian, but this
 matches against Radarr/TMDB titles, which are English.
+
+The fleet's `llama-server` accepts only `Authorization: Bearer <key>`. Put that
+key (the `llm` container's `/etc/llama/api-key`) into
+`/opt/media-stack/llm-api-key` inside this LXC, `chmod 600`, owned by root — or
+pass `LLM_API_KEY` / `LLM_API_KEY_FILE`. Without it the script stops with a
+clear message instead of a traceback. `LLM_MODEL=<id>` makes it refuse to run
+while another model holds the card. Model output is untrusted: blank lines and
+`-->` are stripped from each translated cue, so a reply can never add or shift
+cues.
 
 The translator is `scripts/subs-translate.py`; it can also be run directly:
 
@@ -357,7 +394,8 @@ translator. It reads naturally and is worth watching, but expect the occasional
 gender-agreement slip (one here: a neuter noun given a masculine adjective).
 
 **Manual fallback** (only if `grab` itself is broken): download the `.torrent`
-from toloka.to while logged in → qBittorrent UI `http://192.168.1.216:8085` →
+from toloka.to while logged in → qBittorrent UI `http://localhost:8085` through the
+temporary proxy + SSH tunnel from README Step 4 →
 add, saves under `/data/torrents`, **leave the category empty** → Radarr →
 *Wanted → Manual Import*, folder `/data/torrents`, pick the file, set movie +
 quality, Import with mode **Copy**. API equivalent:

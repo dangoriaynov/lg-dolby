@@ -22,7 +22,7 @@ Self-hosted media server running in an LXC container. Search, download, and stre
 ┌─ LAN ──────────────────────────────────────────────┐
 │                                                     │
 │  Ubuntu 24.04 Host (192.168.1.216)                  │
-│  ├── NVIDIA RTX GPU (driver on host)                │
+│  ├── NVIDIA RTX GPU (driver on host, used by llm)   │
 │  └── LXC container "media-server"                   │
 │      ├── Docker                                     │
 │      │   ├── Jellyfin     (:8096)  ◄── LG TV        │
@@ -32,7 +32,7 @@ Self-hosted media server running in an LXC container. Search, download, and stre
 │      │   ├── Prowlarr     (:9696)  (internal)       │
 │      │   ├── qBittorrent  (:8085)  (internal)       │
 │      │   └── Bazarr       (:6767)  (internal)       │
-│      └── NVIDIA Container Toolkit (NVENC)           │
+│      └── (no GPU — it belongs to the llm LXC)       │
 │                                                     │
 │  LG TV ──HDMI eARC──► TCL Soundbar (Dolby Atmos)   │
 └─────────────────────────────────────────────────────┘
@@ -52,11 +52,14 @@ Self-hosted media server running in an LXC container. Search, download, and stre
 
 ## Deployment
 
-### Step 1: Host setup (creates LXC container + GPU passthrough)
+### Step 1: Host setup (creates the LXC container, no GPU)
 
 ```bash
 sudo bash host-setup.sh
 ```
+
+The GPU stays with the `llm` container; `WITH_GPU=1` passes it through only if
+that policy ever changes (docs/runbook.md §2).
 
 ### Step 2: Push files into the container
 
@@ -74,23 +77,31 @@ lxc exec media-server -- bash -c 'cd /root && bash setup.sh'
 ### Step 4: Open admin ports for initial configuration
 
 These ports are only needed during setup. The admin services communicate internally via Docker network and don't need outside access for normal operation.
+Inside the LXC they listen on `127.0.0.1` only, so they are not reachable from the
+LXD bridge or the VPN. Open them on the **host's loopback** and reach them through
+an SSH tunnel — never `listen=tcp:0.0.0.0:…`, which would put an admin UI (some of
+which skip their login for private addresses) on the whole LAN:
 
 ```bash
-# Temporarily expose admin UIs for configuration
-lxc config device add media-server proxy-radarr proxy listen=tcp:0.0.0.0:7878 connect=tcp:127.0.0.1:7878
-lxc config device add media-server proxy-sonarr proxy listen=tcp:0.0.0.0:8989 connect=tcp:127.0.0.1:8989
-lxc config device add media-server proxy-prowlarr proxy listen=tcp:0.0.0.0:9696 connect=tcp:127.0.0.1:9696
-lxc config device add media-server proxy-qbittorrent proxy listen=tcp:0.0.0.0:8085 connect=tcp:127.0.0.1:8085
-lxc config device add media-server proxy-bazarr proxy listen=tcp:0.0.0.0:6767 connect=tcp:127.0.0.1:6767
+# On the host: temporarily expose admin UIs on the host's 127.0.0.1
+lxc config device add media-server proxy-radarr proxy listen=tcp:127.0.0.1:7878 connect=tcp:127.0.0.1:7878
+lxc config device add media-server proxy-sonarr proxy listen=tcp:127.0.0.1:8989 connect=tcp:127.0.0.1:8989
+lxc config device add media-server proxy-prowlarr proxy listen=tcp:127.0.0.1:9696 connect=tcp:127.0.0.1:9696
+lxc config device add media-server proxy-qbittorrent proxy listen=tcp:127.0.0.1:8085 connect=tcp:127.0.0.1:8085
+lxc config device add media-server proxy-bazarr proxy listen=tcp:127.0.0.1:6767 connect=tcp:127.0.0.1:6767
+
+# On the laptop: tunnel them, then open http://localhost:<port>
+ssh -N -L 7878:127.0.0.1:7878 -L 8989:127.0.0.1:8989 -L 9696:127.0.0.1:9696 \
+       -L 8085:127.0.0.1:8085 -L 6767:127.0.0.1:6767 danko@10.100.0.1
 ```
 
 ### Step 5: Configure services (in order)
 
-1. **qBittorrent** (`http://192.168.1.216:8085`) — get temp password: `lxc exec media-server -- docker logs qbittorrent 2>&1 | grep password`, change it, set save path to `/data/torrents`
-2. **Radarr** (`http://192.168.1.216:7878`) — add root folder `/data/media/movies`, add qBittorrent as download client (host: `qbittorrent`, port: `8085`, category: `radarr`), enable hardlinks
-3. **Sonarr** (`http://192.168.1.216:8989`) — same as Radarr with root folder `/data/media/tv`, category: `sonarr`
-4. **Prowlarr** (`http://192.168.1.216:9696`) — add toloka.to (or other trackers), connect to Radarr and Sonarr via Settings → Apps (use their API keys)
-5. **Bazarr** (`http://192.168.1.216:6767`) — add subtitle languages, enable providers (OpenSubtitles.com), connect to Radarr/Sonarr
+1. **qBittorrent** (`http://localhost:8085` via the tunnel) — get temp password: `lxc exec media-server -- docker logs qbittorrent 2>&1 | grep password`, change it, set save path to `/data/torrents`
+2. **Radarr** (`http://localhost:7878` via the tunnel) — add root folder `/data/media/movies`, add qBittorrent as download client (host: `qbittorrent`, port: `8085`, category: `radarr`), enable hardlinks
+3. **Sonarr** (`http://localhost:8989` via the tunnel) — same as Radarr with root folder `/data/media/tv`, category: `sonarr`
+4. **Prowlarr** (`http://localhost:9696` via the tunnel) — add toloka.to (or other trackers), connect to Radarr and Sonarr via Settings → Apps (use their API keys)
+5. **Bazarr** (`http://localhost:6767` via the tunnel) — add subtitle languages, enable providers (OpenSubtitles.com), connect to Radarr/Sonarr
 6. **Jellyfin** (`http://192.168.1.216:8096`) — run wizard, add libraries (`/data/media/movies`, `/data/media/tv`). **Do not enable NVENC** — Jellyfin has no GPU (reserved for the `llm` container); leave transcoding on CPU / rely on direct play. See [docs/runbook.md](docs/runbook.md)
 7. **Jellyseerr** (`http://192.168.1.216:5055`) — sign in with Jellyfin (`http://jellyfin:8096`), add Radarr (`http://radarr:7878`) and Sonarr (`http://sonarr:8989`)
 
@@ -144,7 +155,7 @@ pings Jellyfin to scan and Seerr to refresh availability. See runbook §6.
 | 5055/tcp | Jellyseerr | Browse & request UI |
 | 6881/tcp+udp | qBittorrent | Torrent peer traffic |
 
-### Internal only (Docker network)
+### Internal only (Docker network, published on the LXC's 127.0.0.1)
 
 | Port | Service |
 |---|---|
@@ -158,8 +169,8 @@ pings Jellyfin to scan and Seerr to refresh availability. See runbook §6.
 
 | File | Where to run | Purpose |
 |---|---|---|
-| `host-setup.sh` | Ubuntu host | Creates LXC container, GPU passthrough, port forwarding |
-| `setup.sh` | Inside container | Installs Docker, NVIDIA toolkit, launches stack |
+| `host-setup.sh` | Ubuntu host | Creates LXC container, port forwarding (GPU only with `WITH_GPU=1`) |
+| `setup.sh` | Inside container | Installs Docker (NVIDIA toolkit only if a GPU is present), launches stack |
 | `docker-compose.yml` | Inside container | Defines all 7 services |
 
 ## Autostart

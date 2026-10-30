@@ -23,7 +23,11 @@ done
 # і розʼїхатись у версіях вони не мають.
 # Архів приймає stdin самого `lxc exec` — без `lxc file push`, який LXD тут
 # відхиляє (Error: Forbidden). Одне зʼєднання: розпакували й одразу запустили.
+# Проміжний файл на хості — свій для кожного запуску (mktemp, 0600): спільний
+# /tmp/grab.tar інший користувач хоста міг би підмінити між записом і
+# розпакуванням, і його код виконався б від root усередині LXC.
 tar -C "$DIR" -cf - scripts/grab.py scripts/subs-translate.py | ssh -o ConnectTimeout=20 "$HOST" \
-  "cat > /tmp/grab.tar \
-   && lxc exec media-server -- tar -xf - -C /opt/media-stack --strip-components=1 < /tmp/grab.tar \
+  "t=\$(mktemp) && trap 'rm -f \"\$t\"' EXIT \
+   && cat > \"\$t\" \
+   && lxc exec media-server -- tar -xf - -C /opt/media-stack --strip-components=1 < \"\$t\" \
    && lxc exec media-server -- python3 /opt/media-stack/grab.py${quoted}"

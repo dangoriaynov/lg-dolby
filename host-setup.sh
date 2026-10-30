@@ -5,13 +5,17 @@ set -euo pipefail
 # HOST Setup Script — Run on the Ubuntu 24.04 HOST (homelab, 192.168.1.216)
 #
 # This script:
-#   1. Verifies NVIDIA driver on the host
-#   2. Creates LXC container "media-server" on existing LXD bridge
-#   3. Configures GPU passthrough + Docker nesting
-#   4. Adds LXD proxy devices so services are reachable at 192.168.1.216:<port>
-#   5. Installs nvidia-utils inside container (must match host driver)
+#   1. Creates LXC container "media-server" on existing LXD bridge
+#   2. Configures Docker nesting
+#   3. Adds LXD proxy devices so services are reachable at 192.168.1.216:<port>
 #
-# Usage: sudo bash host-setup.sh
+# The GPU is reserved for the `llm` container (docs/runbook.md §2), so it is
+# NOT passed through by default: a device node in a container that runs a
+# torrent client is attack surface with no use. WITH_GPU=1 restores the old
+# behaviour (driver check, GPU device, nvidia-utils inside the container).
+#
+# Usage: sudo bash host-setup.sh            (no GPU)
+#        sudo WITH_GPU=1 bash host-setup.sh (GPU passthrough)
 # =============================================================================
 
 RED='\033[0;31m'
@@ -25,6 +29,7 @@ err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 CONTAINER_NAME="media-server"
 HOST_IP="192.168.1.216"
+WITH_GPU="${WITH_GPU:-0}"
 
 if [ "$EUID" -ne 0 ]; then
     err "Please run as root: sudo bash host-setup.sh"
@@ -32,7 +37,7 @@ fi
 
 echo ""
 echo "========================================================"
-echo " HOST Setup: LXC Container + NVIDIA GPU Passthrough"
+echo " HOST Setup: LXC Container (GPU passthrough: WITH_GPU=$WITH_GPU)"
 echo " Container: $CONTAINER_NAME"
 echo " Host NIC:  enp11s0 ($HOST_IP)"
 echo " Network:   default LXD bridge + proxy devices"
@@ -40,28 +45,37 @@ echo "========================================================"
 echo ""
 
 # =============================================================
-# Step 1: Verify NVIDIA Driver on HOST
+# Step 1: Verify NVIDIA Driver on HOST (only with WITH_GPU=1)
 # =============================================================
-echo "--- Step 1: Verifying NVIDIA driver on host ---"
+gpu_preflight() {
+    echo "--- Step 1: Verifying NVIDIA driver on host ---"
 
-if ! command -v nvidia-smi &> /dev/null; then
-    err "nvidia-smi not found. Install the NVIDIA driver first:
-    sudo apt install ubuntu-drivers-common
-    sudo ubuntu-drivers install --gpgpu
-    sudo reboot"
-fi
+    if ! command -v nvidia-smi &> /dev/null; then
+        err "nvidia-smi not found. Install the NVIDIA driver first:
+        sudo apt install ubuntu-drivers-common
+        sudo ubuntu-drivers install --gpgpu
+        sudo reboot"
+    fi
 
-if ! nvidia-smi &> /dev/null; then
-    err "nvidia-smi failed. The driver may need a reboot: sudo reboot"
-fi
+    if ! nvidia-smi &> /dev/null; then
+        err "nvidia-smi failed. The driver may need a reboot: sudo reboot"
+    fi
 
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-HOST_DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-HOST_DRIVER_MAJOR=${HOST_DRIVER_VERSION%%.*}
-log "NVIDIA driver OK: $GPU_NAME (driver $HOST_DRIVER_VERSION)"
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+    HOST_DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+    HOST_DRIVER_MAJOR=${HOST_DRIVER_VERSION%%.*}
+    log "NVIDIA driver OK: $GPU_NAME (driver $HOST_DRIVER_VERSION)"
 
-if [ ! -e /dev/nvidia0 ]; then
-    err "/dev/nvidia0 not found. Driver may not be loaded. Try: sudo reboot"
+    if [ ! -e /dev/nvidia0 ]; then
+        err "/dev/nvidia0 not found. Driver may not be loaded. Try: sudo reboot"
+    fi
+}
+
+GPU_NAME="none"
+if [ "$WITH_GPU" = "1" ]; then
+    gpu_preflight
+else
+    log "No GPU passthrough (WITH_GPU=1 to enable)"
 fi
 
 # =============================================================
@@ -102,10 +116,18 @@ log "Syscall interception enabled (mknod + setxattr)"
 lxc config set "$CONTAINER_NAME" raw.lxc "lxc.apparmor.profile=unconfined"
 log "AppArmor set to unconfined (fixes Docker in Ubuntu 24.04)"
 
-# Pass through NVIDIA GPU
-lxc config device add "$CONTAINER_NAME" gpu gpu 2>/dev/null && \
-    log "NVIDIA GPU device added" || \
-    warn "GPU device may already exist (OK if re-running)"
+# Captured, not piped into `grep -q`: under pipefail that fails exactly on a match.
+DEVICES="$(lxc config device show "$CONTAINER_NAME")"
+if [ "$WITH_GPU" = "1" ]; then
+    if lxc config device add "$CONTAINER_NAME" gpu gpu 2>/dev/null; then
+        log "NVIDIA GPU device added"
+    else
+        warn "GPU device may already exist (OK if re-running)"
+    fi
+elif grep -q '^gpu:' <<< "$DEVICES"; then
+    lxc config device remove "$CONTAINER_NAME" gpu
+    log "GPU device removed (policy: the GPU belongs to the llm container)"
+fi
 
 # =============================================================
 # Step 4: Add proxy devices (port forwarding from host to container)
@@ -162,49 +184,51 @@ CONTAINER_INTERNAL_IP=$(lxc list "$CONTAINER_NAME" --format csv -c 4 | head -1 |
 log "Container internal IP: $CONTAINER_INTERNAL_IP (on LXD bridge)"
 log "Services will be accessible at $HOST_IP via proxy devices"
 
-# =============================================================
-# Step 6: Install NVIDIA utilities inside container
-# =============================================================
-echo ""
-echo "--- Step 6: Installing NVIDIA utilities inside container ---"
+if [ "$WITH_GPU" = "1" ]; then
+    # =============================================================
+    # Step 6: Install NVIDIA utilities inside container
+    # =============================================================
+    echo ""
+    echo "--- Step 6: Installing NVIDIA utilities inside container ---"
 
-log "Host driver version: $HOST_DRIVER_VERSION (major: $HOST_DRIVER_MAJOR)"
+    log "Host driver version: $HOST_DRIVER_VERSION (major: $HOST_DRIVER_MAJOR)"
 
-lxc exec "$CONTAINER_NAME" -- apt-get update -qq
+    lxc exec "$CONTAINER_NAME" -- apt-get update -qq
 
-# Try exact major version first, then common fallbacks
-INSTALLED=false
-for ver in "$HOST_DRIVER_MAJOR" 570 565 560 555 550 545; do
-    if lxc exec "$CONTAINER_NAME" -- apt-get install -y -qq "nvidia-utils-${ver}" 2>/dev/null; then
-        log "nvidia-utils-${ver} installed inside container"
-        INSTALLED=true
-        break
+    # Try exact major version first, then common fallbacks
+    INSTALLED=false
+    for ver in "$HOST_DRIVER_MAJOR" 570 565 560 555 550 545; do
+        if lxc exec "$CONTAINER_NAME" -- apt-get install -y -qq "nvidia-utils-${ver}" 2>/dev/null; then
+            log "nvidia-utils-${ver} installed inside container"
+            INSTALLED=true
+            break
+        fi
+    done
+
+    if [ "$INSTALLED" = false ]; then
+        warn "Could not auto-install nvidia-utils matching host driver $HOST_DRIVER_VERSION"
+        warn "Manually install inside container:"
+        warn "  lxc exec $CONTAINER_NAME -- apt install nvidia-utils-$HOST_DRIVER_MAJOR"
     fi
-done
 
-if [ "$INSTALLED" = false ]; then
-    warn "Could not auto-install nvidia-utils matching host driver $HOST_DRIVER_VERSION"
-    warn "Manually install inside container:"
-    warn "  lxc exec $CONTAINER_NAME -- apt install nvidia-utils-$HOST_DRIVER_MAJOR"
-fi
-
-# =============================================================
-# Step 7: Verify GPU inside container
-# =============================================================
-echo ""
-echo "--- Step 7: Verifying GPU access inside container ---"
-
-echo ""
-if lxc exec "$CONTAINER_NAME" -- nvidia-smi; then
+    # =============================================================
+    # Step 7: Verify GPU inside container
+    # =============================================================
     echo ""
-    log "GPU is accessible inside the container!"
-else
+    echo "--- Step 7: Verifying GPU access inside container ---"
+
     echo ""
-    warn "nvidia-smi failed inside container."
-    warn "This often means nvidia-utils version mismatch."
-    warn "Check host version: nvidia-smi"
-    warn "Then inside container: apt list --installed 2>/dev/null | grep nvidia-utils"
-    warn "Install matching version: lxc exec $CONTAINER_NAME -- apt install nvidia-utils-$HOST_DRIVER_MAJOR"
+    if lxc exec "$CONTAINER_NAME" -- nvidia-smi; then
+        echo ""
+        log "GPU is accessible inside the container!"
+    else
+        echo ""
+        warn "nvidia-smi failed inside container."
+        warn "This often means nvidia-utils version mismatch."
+        warn "Check host version: nvidia-smi"
+        warn "Then inside container: apt list --installed 2>/dev/null | grep nvidia-utils"
+        warn "Install matching version: lxc exec $CONTAINER_NAME -- apt install nvidia-utils-$HOST_DRIVER_MAJOR"
+    fi
 fi
 
 # =============================================================
@@ -216,7 +240,7 @@ echo " HOST Setup Complete!"
 echo "========================================================"
 echo ""
 echo " Container: $CONTAINER_NAME"
-echo " GPU:       $GPU_NAME (NVENC)"
+echo " GPU:       $GPU_NAME"
 echo " Network:   LXD bridge + proxy (3 ports forwarded)"
 echo ""
 echo " Exposed on $HOST_IP:"
