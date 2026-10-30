@@ -31,6 +31,29 @@ import urllib.error
 import urllib.request
 
 LLM_URL = os.environ.get("LLM_URL", "http://10.48.230.217:8081")
+# llama-server фліту приймає лише `Authorization: Bearer` (ключ — /etc/llama/api-key
+# у `llm`). Тут він лежить файлом 0600 поза репо; можна й змінною середовища.
+LLM_KEY_FILE = os.environ.get("LLM_API_KEY_FILE", "/opt/media-stack/llm-api-key")
+# Модель спільна: якщо карту зараз тримає інша (під лізом), не перекладаємо нею.
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
+# Субтитри повнометражного фільму — сотні КБ; більше — це не SRT.
+SRT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def llm_key():
+    key = os.environ.get("LLM_API_KEY", "")
+    if not key and os.path.exists(LLM_KEY_FILE):
+        with open(LLM_KEY_FILE, encoding="utf-8") as fh:
+            key = fh.read().strip()
+    return key
+
+
+def llm_headers():
+    headers = {"Content-Type": "application/json"}
+    key = llm_key()
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    return headers
 
 SYSTEM = """Ти перекладаєш субтитри повнометражного дитячого мультфільму з англійської українською.
 
@@ -56,16 +79,32 @@ def llm(messages, max_tokens=3000, temperature=0.3, timeout=600):
     }
     req = urllib.request.Request(LLM_URL + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=llm_headers())
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read())
-    return data["choices"][0]["message"].get("content") or ""
+        raw = resp.read()
+    # Відповідь сервера моделі — теж недовірена: не та форма = порожня відповідь,
+    # і пачка піде на повтор/поділ, а не обвалить переклад усього фільму.
+    try:
+        content = json.loads(raw)["choices"][0]["message"].get("content")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    return content if isinstance(content, str) else ""
 
 
 def model_name():
-    req = urllib.request.Request(LLM_URL + "/v1/models")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)["data"][0]["id"]
+    req = urllib.request.Request(LLM_URL + "/v1/models", headers=llm_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            name = json.load(resp)["data"][0]["id"]
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            sys.exit("llama-server відмовив (%d): поклади його ключ у %s (0600) або в LLM_API_KEY"
+                     % (exc.code, LLM_KEY_FILE))
+        raise
+    if LLM_MODEL and name != LLM_MODEL:
+        sys.exit("модель зайнята: зараз завантажена %s, а не %s — спробуй пізніше"
+                 % (name, LLM_MODEL))
+    return name
 
 
 def unfence(text):
@@ -103,7 +142,10 @@ TIMING = re.compile(r"-->")
 
 
 def parse_srt(path):
-    raw = open(path, encoding="utf-8-sig", errors="replace").read()
+    if os.path.getsize(path) > SRT_MAX_BYTES:
+        sys.exit("ФАТАЛЬНО: %s більший за %d МБ — це не субтитри" % (path, SRT_MAX_BYTES >> 20))
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        raw = fh.read()
     cues = []
     for block in re.split(r"\r?\n\r?\n", raw.strip()):
         lines = [l.rstrip("\r") for l in block.split("\n") if l.strip() != ""]
@@ -120,11 +162,22 @@ def parse_srt(path):
     return cues
 
 
+def cue_body(text):
+    """Переклад моделі → тіло однієї репліки.
+
+    Вихід моделі недовірений (англійські субтитри з OpenSubtitles пише будь-хто,
+    і prompt injection у них легко дає довільну відповідь). Порожній рядок
+    закінчив би репліку, а рядок із `-->` плеєр прочитав би як новий тайм-код —
+    тож обидва прибираємо, щоб відповідь не могла додати чи зсунути репліки.
+    """
+    lines = text.replace("\\n", "\n").replace("\r", "").split("\n")
+    return "\n".join(l.replace("-->", "->") for l in lines if l.strip())
+
+
 def write_srt(path, cues, translations):
     out = []
     for i, (cue, text) in enumerate(zip(cues, translations), start=1):
-        body = text.replace("\\n", "\n").strip("\n")
-        out.append("%d\n%s\n%s\n" % (i, cue["timing"], body))
+        out.append("%d\n%s\n%s\n" % (i, cue["timing"], cue_body(text)))
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(out))
 
