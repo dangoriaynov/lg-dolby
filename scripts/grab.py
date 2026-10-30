@@ -51,6 +51,17 @@ SEERR = "http://127.0.0.1:5055"
 JELLYFIN = "http://127.0.0.1:8096"
 
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov")
+# .torrent рідко більший за кілька МБ; межа — щоб зламаний індексер не з'їв памʼять.
+TORRENT_MAX_BYTES = 20 * 1024 * 1024
+
+# Керівні символи (ESC, CR, переноси) з назв релізів: їх пише будь-хто на
+# публічному трекері, а grab друкує їх у термінал і в grab.log.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def clean(text):
+    """Чужий рядок → один рядок без керівних послідовностей термінала."""
+    return CONTROL.sub(" ", str(text if text is not None else ""))
 
 # Кирилиця, що виглядає як латиниця: "1080р" на toloka — з кириличною 'р'.
 HOMOGLYPHS = str.maketrans({
@@ -63,10 +74,17 @@ HOMOGLYPHS = str.maketrans({
 # credentials — читаються з конфігів у рантаймі, нічого не зашито в код
 # --------------------------------------------------------------------------
 
-def arr_key(service):
-    path = os.path.join(CONFIG_ROOT, service, "config.xml")
+def config_value(path, pattern):
+    """Значення з конфіга сервісу; немає його — зрозуміла відмова, а не traceback."""
     with open(path, encoding="utf-8") as fh:
-        return re.search(r"<ApiKey>([^<]+)", fh.read()).group(1)
+        match = re.search(pattern, fh.read())
+    if not match:
+        raise SystemExit("Не знайшов ключа в %s — сервіс ще не налаштований?" % path)
+    return match.group(1)
+
+
+def arr_key(service):
+    return config_value(os.path.join(CONFIG_ROOT, service, "config.xml"), r"<ApiKey>([^<]+)")
 
 
 def seerr_settings():
@@ -75,9 +93,8 @@ def seerr_settings():
 
 
 def bazarr_key():
-    path = os.path.join(CONFIG_ROOT, "bazarr", "config", "config.yaml")
-    with open(path, encoding="utf-8") as fh:
-        return re.search(r"apikey:\s*(\S+)", fh.read()).group(1)
+    return config_value(os.path.join(CONFIG_ROOT, "bazarr", "config", "config.yaml"),
+                        r"apikey:\s*(\S+)")
 
 
 def on_lxc(container_path):
@@ -95,6 +112,8 @@ def qb_creds():
         ).fetchone()
     finally:
         con.close()
+    if not row:
+        raise SystemExit("У Radarr немає download client'а qBittorrent — додай його (README, крок 5).")
     cfg = json.loads(row[0])
     return cfg["username"], cfg["password"]
 
@@ -128,15 +147,21 @@ def fetch_release(url):
     """
     if url.startswith("magnet:"):
         return "magnet", url
+    # Посилання приходить з результату індексера, а grab працює від root:
+    # urllib уміє file:// і ftp://, тож усе, крім http(s), — відмова.
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise SystemExit("Посилання релізу не http(s) — не тягну: %r" % clean(url[:60]))
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(url, timeout=120) as resp:
-            blob = resp.read()
+            blob = resp.read(TORRENT_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:
         location = (exc.headers.get("Location") or "") if exc.headers else ""
         if 300 <= exc.code < 400 and location.startswith("magnet:"):
             return "magnet", location
         raise
+    if len(blob) > TORRENT_MAX_BYTES:
+        raise SystemExit("Prowlarr віддав понад %d МБ — це не .torrent." % (TORRENT_MAX_BYTES >> 20))
     if blob[:1] != b"d":
         raise SystemExit("Prowlarr віддав не .torrent (%r…) — перевір індексер." % blob[:40])
     return "torrent", blob
@@ -198,16 +223,23 @@ class QBit:
 # state
 # --------------------------------------------------------------------------
 
-def take_lock(quiet):
-    """Імпорт має виконуватись в один потік: cron (*/5) і ручний запуск легко
-    перетинаються, а два ManualImport одного файлу дають дубль у бібліотеці."""
+def take_lock(quiet, wait=False):
+    """Стан змінює лише один grab: cron (*/5) і ручний запуск легко
+    перетинаються, а два ManualImport одного файлу дають дубль у бібліотеці.
+    Ручний пошук чи `grab 0` теж пишуть стан: без замка cron, що прочитав його
+    раніше, записав би свою копію поверх і новий торент випав би з нагляду.
+    cron (wait=False) пропускає прогін, людина (wait=True) чекає своєї черги."""
     handle = open(LOCK_PATH, "w")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        if not quiet:
-            print("Інший grab уже імпортує — пропускаю.")
-        return None
+        if not wait:
+            if not quiet:
+                print("Інший grab уже імпортує — пропускаю.")
+            handle.close()
+            return None
+        print("Інший grab зараз змінює стан — чекаю, доки закінчить…")
+        fcntl.flock(handle, fcntl.LOCK_EX)
     return handle  # тримаємо відкритим до кінця процесу
 
 
@@ -398,11 +430,11 @@ def cmd_search(query, state):
         aim = ("→ %s (%s)" % (target["title"], target["year"])) if target else "→ ціль не вгадав, вкажи --to"
         flag = "" if not target or not target["have"] else "  [вже є файл]"
         also = (" (також: %s)" % ", ".join(row["also"])) if row.get("also") else ""
-        print("[%d] %s" % (idx, row["title"]))
+        print("[%d] %s" % (idx, clean(row["title"])))
         print("    %.2f ГБ · сідів %s · %s%s · %s" % (
-            row["size"] / 1e9, row["seeders"], row["indexer"], also,
-            ", ".join(row["categories"][:2])))
-        print("    %s%s" % (aim, flag))
+            row["size"] / 1e9, clean(row["seeders"]), clean(row["indexer"]), clean(also),
+            clean(", ".join(row["categories"][:2]))))
+        print("    %s%s" % (clean(aim), flag))
     print("\nВзяти:  grab <номер>            (напр. grab 0)")
     print("Явно:   grab <номер> --to movie:<id>|series:<id>")
     return 0
@@ -465,8 +497,8 @@ def cmd_get(index, to_spec, state):
     })
     save_state(state)
 
-    print("✓ Додано в qBittorrent: %s" % name)
-    print("  %.2f ГБ → %s (%s)" % (row["size"] / 1e9, target["title"], target["kind"]))
+    print("✓ Додано в qBittorrent: %s" % clean(name))
+    print("  %.2f ГБ → %s (%s)" % (row["size"] / 1e9, clean(target["title"]), target["kind"]))
     print("  Далі нічого робити не треба: cron доімпортує сам (або `grab finish`).")
     return 0
 
@@ -627,8 +659,8 @@ def cmd_finish(state, quiet=False):
             continue
         if torrent["progress"] < 1:
             if not quiet:
-                print("… %s — %.1f%% (%s)" % (entry["name"][:60], torrent["progress"] * 100,
-                                              torrent["state"]))
+                print("… %s — %.1f%% (%s)" % (clean(entry["name"][:60]), torrent["progress"] * 100,
+                                              clean(torrent["state"])))
             continue
 
         kind = entry["target"]["kind"]
@@ -639,13 +671,13 @@ def cmd_finish(state, quiet=False):
         try:
             ok, note = worker(entry, torrent, tables[kind], qb)
         except Exception as exc:  # мережа/API — лишаємо в черзі на наступний прогін
-            print("! %s — імпорт впав: %s" % (entry["name"][:60], exc))
+            print("! %s — імпорт впав: %s" % (clean(entry["name"][:60]), clean(exc)))
             continue
 
         entry["status"] = "imported" if ok else "failed"
         entry["note"] = note
         print(("✓ Імпортовано: %s → %s" if ok else "! Не вийшло: %s — %s")
-              % (entry["target"]["title"], note))
+              % (clean(entry["target"]["title"]), clean(note)))
         if ok:
             imported.append(entry)
 
@@ -665,7 +697,7 @@ def cmd_import(part, to_spec, state):
     if len(hits) > 1:
         print("Підходить кілька — уточни:")
         for t in hits:
-            print("  -", t["name"])
+            print("  -", clean(t["name"]))
         return 1
     torrent = hits[0]
     target = resolve_target(to_spec, candidates())
@@ -701,7 +733,8 @@ def fetch_english_srt(movie_id, folder):
     if not english:
         return None
     best = english[0]
-    print("   англійські субтитри: score %s від %s" % (best.get("score"), best.get("provider")))
+    print("   англійські субтитри: score %s від %s"
+          % (clean(best.get("score")), clean(best.get("provider"))))
     # OpenSubtitles регулярно рве першу спробу (RemoteDisconnected), а Bazarr
     # усе одно відповідає 204 — тому дивимось на диск, а не на код відповіді,
     # і пробуємо двічі.
@@ -736,14 +769,14 @@ def cmd_subs(query, state):
     if len(hits) > 1:
         print("Підходить кілька — уточни запит:")
         for m in hits[:10]:
-            print("   %s (%s)" % (m["title"], m["year"]))
+            print("   %s (%s)" % (clean(m["title"]), m["year"]))
         return 1
 
     movie = hits[0]
     folder = on_lxc(movie["path"])
     if not os.path.isdir(folder):
         raise SystemExit("Тека фільму не знайдена: %s" % folder)
-    print("фільм: %s (%s)" % (movie["title"], movie["year"]))
+    print("фільм: %s (%s)" % (clean(movie["title"]), movie["year"]))
 
     if [f for f in os.listdir(folder) if f.lower().endswith(".uk.srt")]:
         print("   українські субтитри вже є — нічого не роблю")
@@ -755,7 +788,7 @@ def cmd_subs(query, state):
         raise SystemExit("Англійських субтитрів немає ні на диску, ні в провайдерів — "
                          "перекладати нема з чого.")
 
-    print("   перекладаю %s" % os.path.basename(path))
+    print("   перекладаю %s" % clean(os.path.basename(path)))
     code = subprocess.call(["python3", TRANSLATOR, path])
     if code != 0:
         raise SystemExit("переклад не вдався (код %d)" % code)
@@ -785,14 +818,14 @@ def cmd_status(state):
     for entry in active:
         torrent = torrents.get(entry["hash"])
         if not torrent:
-            print("  ? %s — торента немає в qB" % entry["name"][:60])
+            print("  ? %s — торента немає в qB" % clean(entry["name"][:60]))
             continue
         speed = (torrent.get("dlspeed") or 0) / 1e6
         eta = torrent.get("eta")
         eta_text = "—" if not eta or eta > 8639999 else "%d хв" % (eta // 60)
-        print("  %5.1f%%  %s" % (torrent["progress"] * 100, entry["name"][:62]))
+        print("  %5.1f%%  %s" % (torrent["progress"] * 100, clean(entry["name"][:62])))
         print("         %.1f МБ/с · залишилось %s · → %s"
-              % (speed, eta_text, entry["target"]["title"]))
+              % (speed, eta_text, clean(entry["target"]["title"])))
 
     print("\n== Seerr: запити без файлу ==")
     requests = api(SEERR + "/api/v1/request?take=40&sort=added&sortDirection=desc",
@@ -823,7 +856,7 @@ def cmd_status(state):
                   % ("запит #%s" % req["id"], media.get("tmdbId")))
             continue
         print("  %-52s %s  → grab <№> --to %s:%s"
-              % (title[:52], "частково" if have else "немає файлу", kind, service_id))
+              % (clean(title[:52]), "частково" if have else "немає файлу", kind, service_id))
     if not shown:
         print("  (усе доступне)")
     return 0
@@ -842,8 +875,10 @@ def main():
         return 0
 
     argv = opts.args
-    if argv and argv[0] in ("finish", "f", "import"):
-        if take_lock(opts.quiet) is None:
+    # Стан лише читають статус і субтитри; решта команд його пише.
+    if argv and argv[0] not in ("status", "pending", "s", "subs"):
+        background = argv[0] in ("finish", "f")
+        if take_lock(opts.quiet, wait=not background) is None:
             return 0
 
     state = load_state()
